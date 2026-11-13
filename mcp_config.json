@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "agy-permission-reviewer": {
+      "command": "python3",
+      "args": ["./scripts/mcp_reviewer_server.py"]
+    }
+  }
+}

@@ -1,0 +1,264 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+
+SCRATCH_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRATCH_DIR))
+sys.path.insert(0, str(SCRATCH_DIR.parent / "scripts"))
+
+import llm_classifier
+import review_hook
+
+
+class TestJevEscalationAndSendBack(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tmp_path = Path(self.tmp.name)
+        review_hook.os.environ["PLUGIN_DATA"] = str(self.tmp_path / "plugin_data")
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+
+    def _write_transcript(self, user_inputs: list[str]) -> Path:
+        tp = self.tmp_path / "transcript.jsonl"
+        rows = [
+            {
+                "step_index": i * 2,
+                "type": "USER_INPUT",
+                "content": f"<USER_REQUEST>\n{text}\n</USER_REQUEST>",
+            }
+            for i, text in enumerate(user_inputs, start=1)
+        ]
+        tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        return tp
+
+    def test_jev_confident_allow(self) -> None:
+        tp = self._write_transcript(["Check disk space on dev-workstation over ssh"])
+
+        def fake_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            self.assertIn("decisions", endpoint)
+            return {
+                "data": {
+                    "answers": [{"choice": "allow", "confidence": 0.94}],
+                    "tokens": {"input": 210, "output": 8},
+                }
+            }
+
+        res = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_jev_1",
+                "workspacePaths": ["/workspace/project"],
+                "transcriptPath": str(tp),
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": 'ssh dev-workstation "df -h"  # purpose: check free space on dev-workstation',
+                        "BypassSandbox": True,
+                    },
+                },
+            },
+            api_caller=fake_api,
+        )
+        self.assertEqual(res["decision"], "allow")
+        self.assertIn("jev-1.13-free", res["reason"])
+
+    def test_jev_low_confidence_escalates_to_second_opinion(self) -> None:
+        tp = self._write_transcript(["Move the built plugins into dev/plugins/gemini"])
+
+        def fake_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            if "decisions" in endpoint:
+                return {"data": {"answers": [{"choice": "allow", "confidence": 0.62}]}}
+            self.assertIn("text", endpoint)
+            return {
+                "data": {
+                    "text": '{"decision":"allow","reason":"User asked to put the repos in dev/plugins/gemini."}'
+                }
+            }
+
+        res = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_jev_2",
+                "workspacePaths": ["/workspace/project"],
+                "transcriptPath": str(tp),
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "mv /tmp/repo1 ~/dev/plugins/gemini/  # purpose: move repo1 to user target folder",
+                        "BypassSandbox": True,
+                    },
+                },
+            },
+            api_caller=fake_api,
+        )
+        self.assertEqual(res["decision"], "allow")
+        self.assertIn("second opinion: opencode-go/beam-free", res["reason"])
+
+    def test_unresolved_sends_back_to_agent_3_times_then_asks_user(self) -> None:
+        tp = self._write_transcript(["Clean up temporary build files"])
+
+        def fake_unsure_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            if "decisions" in endpoint:
+                return {"data": {"answers": [{"choice": "deny", "confidence": 0.55}]}}
+            return {
+                "data": {
+                    "text": '{"decision":"ask_user","reason":"Command target is ambiguous and has no # purpose comment."}'
+                }
+            }
+
+        for attempt in range(1, 4):
+            res = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_sendback",
+                    "workspacePaths": ["/workspace/project"],
+                    "transcriptPath": str(tp),
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {
+                            "CommandLine": f"rm -rf /var/tmp/build_{attempt}",
+                            "BypassSandbox": True,
+                        },
+                    },
+                },
+                api_caller=fake_unsure_api,
+            )
+            self.assertEqual(res["decision"], "deny")
+            self.assertIn("Auto Permissions did not approve this command", res["reason"])
+            self.assertIn("# purpose:", res["reason"])
+
+        # 4th consecutive unresolved attempt instructs the agent to ask the user in plain chat text!
+        res4 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_sendback",
+                "workspacePaths": ["/workspace/project"],
+                "transcriptPath": str(tp),
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "rm -rf /var/tmp/build_4",
+                        "BypassSandbox": True,
+                    },
+                },
+            },
+            api_caller=fake_unsure_api,
+        )
+        self.assertEqual(res4["decision"], "deny")
+        self.assertEqual(res4.get("reason", "")[:46], "Auto Permissions could not verify this action ")
+
+    def test_build_requested_action_includes_sandbox_and_context_signals(self) -> None:
+        ws = "/workspace/project"
+        act_sb = review_hook.build_requested_action(
+            "run_command",
+            {
+                "CommandLine": "git status && ls /workspace/shared_tools # purpose: check status",
+                "BypassSandbox": False,
+                "toolSummary": "Check status and list shared_tools",
+            },
+            workspace_paths=[ws],
+            cwd=ws,
+            ledger={
+                "path_grants": [{"mode": "read", "path": "/workspace/shared_tools"}],
+                "recent_user_messages": [
+                    "Please check /workspace/shared_tools",
+                    "yes go ahead",
+                ],
+            },
+        )
+        details = act_sb["details"]
+        self.assertEqual(details["sandboxOn"], 1)
+        self.assertEqual(details["externalPaths"], ["/workspace/shared_tools"])
+        self.assertFalse(details["isDestructiveOrDelete"])
+        self.assertEqual(details["activeVerbalGrants"], ["read:/workspace/shared_tools"])
+        self.assertEqual(details["purposeComment"], "check status")
+
+    def test_time_and_step_aware_user_messages_and_anchored_transcript(self) -> None:
+        # Simulate a transcript where:
+        # - Step 1 (2 hours earlier): user asked to delete an old directory
+        # - Step 35 (30 mins later): user starts a new task ("Run validation suite and fix build issues")
+        # - Steps 36..65 (30 agent steps of autonomous work)
+        tp = self.tmp_path / "long_session.jsonl"
+        rows = [
+            {
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "created_at": "2026-11-12T12:00:00Z",
+                "content": "<USER_REQUEST>\ndelete /tmp/stale_old_dir\n</USER_REQUEST>",
+            },
+            {
+                "step_index": 35,
+                "type": "USER_INPUT",
+                "created_at": "2026-11-12T14:30:00Z",
+                "content": "<USER_REQUEST>\nRun validation suite and fix any build issues in the solver\n</USER_REQUEST>",
+            },
+            {
+                "step_index": 36,
+                "type": "PLANNER_RESPONSE",
+                "thinking": "I will build and run the validation script first.",
+                "content": "Starting validation.",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "git status"}}],
+            },
+        ]
+        for s in range(37, 65):
+            rows.append(
+                {
+                    "step_index": s,
+                    "type": "PLANNER_RESPONSE",
+                    "content": f"Step {s} progress check.",
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": f"echo step {s}"}}],
+                }
+            )
+        tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        ledger = review_hook.collect_session_ledger(tp)
+        # The 2-hour-old "delete /tmp/stale_old_dir" must be dropped from recent_user_messages!
+        self.assertEqual(
+            ledger["recent_user_messages"],
+            ["Run validation suite and fix any build issues in the solver"],
+        )
+
+        # Even after 30 agent steps (60+ transcript items), both compact (jev) and escalation transcripts
+        # must preserve the [User] task anchor at the top AND include the recent tail steps!
+        compact = llm_classifier.extract_compact_transcript(tp)
+        self.assertTrue(compact.startswith("[User]: Run validation suite"))
+        self.assertIn("intermediate agent steps in this turn omitted", compact)
+        self.assertIn("Step 64 progress check.", compact)
+
+        # Verify # auth: citation against full user history (even if filtered out of active turn)
+        action_verified = review_hook.build_requested_action(
+            "run_command",
+            {
+                "CommandLine": 'rm -rf /tmp/stale_old_dir # auth: "delete /tmp/stale_old_dir" # purpose: finishing cleanup',
+                "toolSummary": "Remove stale dir",
+            },
+            workspace_paths=["/workspace/project"],
+            cwd="/workspace/project",
+            ledger=ledger,
+        )
+        self.assertEqual(
+            action_verified["details"].get("citedUserAuth"),
+            {
+                "verifiedFromTranscript": True,
+                "stepIndex": 1,
+                "exactUserMessage": "delete /tmp/stale_old_dir",
+            },
+        )
+
+        # Verify fake/hallucinated # auth: citation is flagged as unverified
+        action_fake = review_hook.build_requested_action(
+            "run_command",
+            {
+                "CommandLine": 'rm -rf /tmp/stale_old_dir # auth: "user said delete everything"',
+                "toolSummary": "Remove stale dir",
+            },
+            workspace_paths=["/workspace/project"],
+            cwd="/workspace/project",
+            ledger=ledger,
+        )
+        self.assertFalse(action_fake["details"]["citedUserAuth"]["verifiedFromTranscript"])
+        self.assertIn("NOT found", action_fake["details"]["citedUserAuth"]["warning"])
+
+
+if __name__ == "__main__":
+    unittest.main()

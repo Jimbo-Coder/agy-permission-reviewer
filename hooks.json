@@ -1,0 +1,17 @@
+{
+  "context-permission-reviewer": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT:-$HOME/.gemini/config/plugins/agy-permission-reviewer}/scripts/review_hook.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

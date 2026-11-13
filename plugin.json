@@ -1,0 +1,14 @@
+{
+  "name": "agy-permission-reviewer",
+  "displayName": "Context-Aware Permission Reviewer",
+  "version": "0.1.0",
+  "disabled": false,
+  "description": "3-tier low-cost PreToolUse permission reviewer: Tier 0 static safety policy, Tier 1 zero-token verbal grant ledger from user messages, and Tier 2 compact decision model classifier with signature caching.",
+  "repository": "https://github.com/Jimbo-Coder/agy-permission-reviewer",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Show active verbal permission grants and recent PreToolUse review decisions",
+    "Audit the last 20 tool permission decisions and token cost",
+    "Explain how the 3-tier permission reviewer evaluates out-of-workspace file access"
+  ]
+}
