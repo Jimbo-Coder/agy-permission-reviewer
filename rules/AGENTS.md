@@ -5,7 +5,7 @@ Shell commands and out-of-workspace file actions that need approval are judged b
 1. **No Tautological Tests, Comments, or UI**:
    - **Comments & `# purpose:` hints**: Never write comments that merely restate what the code or command already says (`i += 1  # increment i` or `pytest tests/  # purpose: run pytest on tests`). Only add a comment or `# purpose:` hint when it conveys *why* (intent, invariant, or non-obvious context) that is not already visible from the command and `toolSummary`.
    - **Tests**: Never write tautological tests that only assert mock return values, mirror implementation constants line-for-line, or cannot fail when real behavior breaks. Every test must exercise a real boundary, invariant, or regression mode.
-   - **UI / Output**: Avoid noisy status banners, redundant wrapper text, or UI chrome that repeats what the underlying data or tool output already shows.
+   - **UI / Output**: Avoid noisy status banners, redundant wrapper text, or UI chrome that repeats what the underlying data or tool output already shows. Keep user-facing chat summaries short, scannable, and in plain English: never dump walls of code identifiers, internal variable or test names, commit hashes, precision thresholds, or raw multi-digit float lists into chat (keep detailed receipts in the audit or log file unless the user asks for specific numbers). Fix persistent workflow or rule issues directly rather than telling the user to run `/learn` or do agent housekeeping.
 
 2. **When Sent Back by Auto Permissions**:
    If a command is refused with an `Auto Permissions did not approve this command` note, do **not** blindly retry the identical command:
