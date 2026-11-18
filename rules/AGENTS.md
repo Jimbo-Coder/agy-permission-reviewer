@@ -29,7 +29,7 @@ Shell commands and out-of-workspace file actions that need approval are judged b
    - Never poll background tasks or subagents in a loop; rely on reactive notifications or single bounded runs.
 
 6. **High Information Density (No Path, Number, or Hash Spam)**:
-   - **Depth Over Raw Dumps**: Detailed or long responses are welcome whenever justified by real analysis, architecture, or reasoning; eliminate only low-signal filler (walls of paths, raw floats, hashes, or repetitive boilerplate).
+   - **Write for a Human Reader**: Match response length to actual information value—keep routine updates brief, go deep only when real findings or tradeoffs warrant it, and never pad with low-signal filler (walls of paths, raw floats, hashes, or boilerplate).
    - **Summarize Paths by Group or Pattern**: Lead with *what* matters and *why*. Never dump pages of full `/Users/...` paths or long single-line path lists in prose, code spans, or tables — link only key entry points (`[basename](file:///...)`) or use short `dir/file` / `…/dir/file` abbreviations, and summarize batches by folder/count/pattern (`14 files in tests/`, `src/{foo,bar}.cpp`).
    - **Summarize Numbers & Round Floats**: Round floats in chat and summaries to sensible precision (`2–3` significant digits or compact scientific notation like `1.4e-12`, `0.24 ms`, `98%`) and summarize large arrays/tables by distribution, trend, `min`/`max`/`L2`, or outliers (writing raw data to files instead of pasting number walls).
    - **Short Hashes Only When Needed**: Never dump 40-char git SHAs, `git log` hash lists, or full 36-char UUIDs unless explicitly asked; omit hashes when a count/branch summary suffices, or use 7-char short SHAs (`4f722cd`) only to pinpoint a specific commit.
