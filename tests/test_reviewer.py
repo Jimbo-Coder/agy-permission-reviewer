@@ -1065,7 +1065,10 @@ class TestPermissionReviewer(unittest.TestCase):
         ws = "/workspace/project"
 
         local_cfg = self.tmp_path / "local_ssh.json"
-        local_cfg.write_text(json.dumps({"known_ssh_hosts": ["DevBox"]}), encoding="utf-8")
+        local_cfg.write_text(
+            json.dumps({"known_ssh_hosts": ["DevBox"], "shared_hpc_hosts": ["cluster-login"]}),
+            encoding="utf-8",
+        )
         review_hook.os.environ["AGY_PERMISSION_REVIEWER_LOCAL_CONFIG"] = str(local_cfg)
         self.addCleanup(lambda: review_hook.os.environ.pop("AGY_PERMISSION_REVIEWER_LOCAL_CONFIG", None))
 
@@ -1159,6 +1162,18 @@ class TestPermissionReviewer(unittest.TestCase):
         req_json = calls[0]["input"][1]["value"]
         self.assertEqual(req_json["requested_action"]["details"]["sshHost"], "devbox")
         self.assertTrue(req_json["requested_action"]["details"]["knownUserSshHost"])
+        self.assertNotIn("sharedHpcHost", req_json["requested_action"]["details"])
+
+        act_cluster = review_hook.build_requested_action(
+            "run_command",
+            {"CommandLine": 'ssh cluster-login "ls $SCRATCH"', "BypassSandbox": True},
+            workspace_paths=[ws],
+            cwd=ws,
+            ledger=ledger,
+        )
+        self.assertEqual(act_cluster["details"]["sshHost"], "cluster-login")
+        self.assertTrue(act_cluster["details"]["knownUserSshHost"])
+        self.assertTrue(act_cluster["details"]["sharedHpcHost"])
         self.assertTrue(
             any("DevBox" in m and "Yes I've allowed it already." in m for m in req_json["recent_user_messages"])
         )

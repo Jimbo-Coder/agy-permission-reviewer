@@ -34,8 +34,10 @@ User-specific repository or path rules can be configured in `~/.gemini/config/pe
     "collaborator-org/reference-repo"
   ],
   "known_ssh_hosts": [
-    "cluster-login",
     "dev-workstation"
+  ],
+  "shared_hpc_hosts": [
+    "cluster-login"
   ],
   "extra_read_only_paths": [],
   "extra_denied_paths": []

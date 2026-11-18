@@ -3,8 +3,10 @@
     "collaborator-org/reference-repo"
   ],
   "known_ssh_hosts": [
-    "cluster-login",
     "dev-workstation"
+  ],
+  "shared_hpc_hosts": [
+    "cluster-login"
   ],
   "extra_read_only_paths": [],
   "extra_denied_paths": []

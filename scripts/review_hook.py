@@ -1515,12 +1515,21 @@ def build_requested_action(
         if ssh_info is not None:
             ssh_host = ssh_info[0]
             details["sshHost"] = ssh_host
+            local_cfg = load_local_config()
             known_hosts = {
                 str(h).strip().lower()
-                for h in load_local_config().get("known_ssh_hosts", [])
+                for h in local_cfg.get("known_ssh_hosts", [])
                 if str(h).strip()
             }
-            if ssh_host in known_hosts:
+            hpc_hosts = {
+                str(h).strip().lower()
+                for h in local_cfg.get("shared_hpc_hosts", [])
+                if str(h).strip()
+            }
+            if ssh_host in hpc_hosts:
+                details["sharedHpcHost"] = True
+                details["knownUserSshHost"] = True
+            elif ssh_host in known_hosts:
                 details["knownUserSshHost"] = True
         if active_grants:
             details["activeVerbalGrants"] = active_grants[-6:]
