@@ -653,9 +653,10 @@ def compute_signature(
     return hashlib.sha256(key_payload.encode("utf-8")).hexdigest()[:24]
 
 
-def compute_directory_grant_key(directory_path: str) -> str:
+def compute_directory_grant_key(directory_path: str, mode: str = "read") -> str:
     norm = os.path.normpath(os.path.expanduser(directory_path))
-    return "dir_grant:" + hashlib.sha256(norm.encode("utf-8")).hexdigest()[:24]
+    m = "write" if mode == "write" else "read"
+    return f"dir_grant:{m}:" + hashlib.sha256(norm.encode("utf-8")).hexdigest()[:24]
 
 
 def compute_ssh_host_grant_key(host: str) -> str:

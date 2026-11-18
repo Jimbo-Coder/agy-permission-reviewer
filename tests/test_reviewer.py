@@ -135,15 +135,43 @@ class TestPermissionReviewer(unittest.TestCase):
     def test_tier1_verbal_grant_read_vs_write_and_prohibition(self) -> None:
         tp = self._write_transcript(
             [
-                "Please inspect /opt/ref_code in read-only mode, and you can create and edit files in /opt/custom_plugins. Never touch /opt/secret_data. Note that /config and /settings are slash commands, not paths."
+                "Disc:29% (~4m) in /setup/tabs. Check /Users and please inspect /opt/ref_code in read-only mode, "
+                "and you can create and edit files in /opt/custom_plugins. Never touch /opt/secret_data. "
+                "Note that /config and /settings are slash commands, not paths."
             ]
         )
+        prev_prose = os.environ.pop("AGY_ENABLE_PROSE_LEDGER", None)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("AGY_ENABLE_PROSE_LEDGER", prev_prose)
+            if prev_prose is not None
+            else os.environ.pop("AGY_ENABLE_PROSE_LEDGER", None)
+        )
+
+        # 0. By default (AGY_ENABLE_PROSE_LEDGER unset/0), prose regex grants are disabled cleanly
+        default_ledger = review_hook.collect_session_ledger(tp)
+        self.assertEqual(default_ledger["path_grants"], [])
+        self.assertEqual(default_ledger["denied_paths"], [])
+        r_default = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c2_default",
+                "workspacePaths": ["/workspace/project"],
+                "transcriptPath": str(tp),
+                "toolCall": {
+                    "name": "read_file",
+                    "args": {"Path": "/opt/ref_code/kernel.hpp"},
+                },
+            }
+        )
+        self.assertEqual(r_default["decision"], "ask")
+
+        # Enable hardened opt-in prose ledger to verify false-grant & read-only protections
+        os.environ["AGY_ENABLE_PROSE_LEDGER"] = "1"
         ledger = review_hook.collect_session_ledger(tp)
         grant_paths = [pg["path"] for pg in ledger["path_grants"]]
-        self.assertNotIn("/config", grant_paths)
-        self.assertNotIn("/settings", grant_paths)
+        for rejected in ("/config", "/settings", "~4m", "/setup/tabs", "/Users", str(Path.home())):
+            self.assertNotIn(rejected, grant_paths)
 
-        # 1. Read from /opt/ref_code -> allowed by Tier 1
+        # 1. Read from /opt/ref_code -> allowed by opt-in Tier 1
         r1 = review_hook.evaluate_tool_call(
             {
                 "conversationId": "c2",
@@ -1197,6 +1225,173 @@ class TestPermissionReviewer(unittest.TestCase):
             self.assertEqual(res_trap["decision"], "ask", msg=f"Expected Tier 0 ask/force_ask for {trap_cmd!r}")
             self.assertEqual(review_hook.to_antigravity_hook_output(res_trap)["decision"], "force_ask")
         self.assertEqual(len(calls), 2)
+
+    def test_security_tightenings_unsandboxed_py_script_rw_dir_cache_and_rm_recursive(self) -> None:
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        ws = "/workspace/project"
+
+        def fail_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            raise AssertionError(f"Tier 2 should not run for safe Tier 0 command ({endpoint})")
+
+        # 1. Sandboxed python3/uv *.py fast-allows at Tier 0, and module test runners remain routine even unsandboxed;
+        #    arbitrary unsandboxed python3 /tmp/script.py and uv run python3 /tmp/script.py MUST escalate to Tier 2.
+        for ok_cmd, bypass in (
+            ("python3 /tmp/script.py", False),
+            ("uv run python3 /tmp/script.py", False),
+            ("python3 -m unittest discover -s tests", True),
+            ("uv run pytest -q", True),
+        ):
+            r_ok = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_sec_t",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": ok_cmd, "BypassSandbox": bypass}},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(r_ok["decision"], "allow", msg=f"Expected Tier 0 allow for {ok_cmd!r} (bypass={bypass})")
+
+        t2_calls: list[str] = []
+
+        def allow_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            t2_calls.append(endpoint)
+            return {"data": {"answers": [{"choice": "allow", "confidence": 0.95}]}}
+
+        def deny_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            t2_calls.append(endpoint)
+            return {"data": {"answers": [{"choice": "deny", "confidence": 0.96}]}}
+
+        for risky_cmd in ("python3 /tmp/script.py", "uv run python3 /tmp/script.py"):
+            t2_calls.clear()
+            r_risky = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_sec_py_deny",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": risky_cmd, "BypassSandbox": True}},
+                },
+                api_caller=deny_api,
+            )
+            self.assertEqual(r_risky["decision"], "deny")
+            self.assertEqual(len(t2_calls), 1, msg=f"Unsandboxed {risky_cmd!r} bypassed Tier 2!")
+
+        # 2. Mode-separated session_dir_cache: read approval caches read_file & git log, NEVER write_file/edit_file/git commit
+        t2_calls.clear()
+        r_read1 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_sec_rw",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {"name": "read_file", "args": {"Path": "/opt/ext_repo/a.py"}},
+            },
+            api_caller=allow_api,
+        )
+        self.assertEqual(r_read1["decision"], "allow")
+        self.assertEqual(len(t2_calls), 1)
+
+        # Sibling read & read-only git log reuse read dir cache (0 extra Tier 2 calls)
+        r_read2 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_sec_rw",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {"name": "read_file", "args": {"Path": "/opt/ext_repo/b.py"}},
+            },
+            api_caller=allow_api,
+        )
+        self.assertEqual(r_read2["decision"], "allow")
+        r_git_ro = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_sec_rw",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "git -C /opt/ext_repo log -n 5", "BypassSandbox": True},
+                },
+            },
+            api_caller=allow_api,
+        )
+        self.assertEqual(r_git_ro["decision"], "allow")
+        self.assertEqual(len(t2_calls), 1)
+
+        # Write attempts (unsandboxed git commit denied once, edit_file approved) must NOT hit read cache
+        r_git_mut = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_sec_rw",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": 'git -C /opt/ext_repo commit -m "x"', "BypassSandbox": True},
+                },
+            },
+            api_caller=deny_api,
+        )
+        self.assertEqual(r_git_mut["decision"], "deny")
+        self.assertEqual(len(t2_calls), 2, msg="Read dir cache must NEVER auto-allow unsandboxed git commit!")
+
+        r_edit1 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_sec_rw",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {"name": "edit_file", "args": {"Path": "/opt/ext_repo/a.py"}},
+            },
+            api_caller=allow_api,
+        )
+        self.assertEqual(r_edit1["decision"], "allow")
+        self.assertEqual(len(t2_calls), 3, msg="Read dir cache must NEVER auto-allow edit_file!")
+
+        # Once write approval is granted on /opt/ext_repo, sibling write_file AND git commit reuse the write cache
+        r_write2 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_sec_rw",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {"name": "write_file", "args": {"Path": "/opt/ext_repo/b.py", "Content": "ok"}},
+            },
+            api_caller=allow_api,
+        )
+        self.assertEqual(r_write2["decision"], "allow")
+        r_git_mut2 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_sec_rw",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": 'git -C /opt/ext_repo commit -m "y"', "BypassSandbox": True},
+                },
+            },
+            api_caller=allow_api,
+        )
+        self.assertEqual(r_git_mut2["decision"], "allow")
+        self.assertEqual(len(t2_calls), 3)
+
+        # 3. Long flags --recursive and --force escalate to Tier 2 as destructive
+        for d_cmd in ("rm --recursive src/old_dir", "git rm --recursive src/old_dir", "git clean -d --force"):
+            for bypass in (False, True):
+                t2_calls.clear()
+                res_d = review_hook.evaluate_tool_call(
+                    {
+                        "conversationId": "c_sec_dest",
+                        "workspacePaths": [ws],
+                        "cwd": ws,
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": d_cmd, "BypassSandbox": bypass}},
+                    },
+                    api_caller=deny_api,
+                )
+                self.assertEqual(res_d["decision"], "deny")
+                self.assertEqual(len(t2_calls), 1, msg=f"{d_cmd!r} (bypass={bypass}) bypassed Tier 2!")
+                act = review_hook.build_requested_action(
+                    "run_command",
+                    {"CommandLine": d_cmd, "BypassSandbox": bypass},
+                    workspace_paths=[ws],
+                    cwd=ws,
+                )
+                self.assertTrue(act["details"]["isDestructiveOrDelete"])
 
 
 if __name__ == "__main__":

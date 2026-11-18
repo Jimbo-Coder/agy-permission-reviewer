@@ -136,8 +136,8 @@ NETWORK_REQUIRED_COMMAND_RE = SANDBOX_INCOMPATIBLE_COMMAND_RE
 # the active workspace, conversation scratch, or /tmp (including BypassSandbox=true for MPI/uv).
 ROUTINE_SEGMENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^git\s+(?:-C\s+\S+\s+)?(?:status|diff|log|show|rev-parse|remote\s+-v$|branch(?:\s+(?:--show-current|--list|-a|-v|-vv|-r))*$|add\b|commit\b|stash\b|check-ignore\b)(?:\s|$)"),
-    re.compile(r"^uv\s+run\s+(?:python3?|pytest|ruff|mypy)\b"),
-    re.compile(r"^python3?\s+(?:-m\s+(?:unittest|pytest|py_compile|ruff|mypy)\b|\S+\.py\b)"),
+    re.compile(r"^uv\s+run\s+(?:python3?\s+-m\s+(?:unittest|pytest|py_compile|ruff|mypy)|pytest|ruff|mypy)\b"),
+    re.compile(r"^python3?\s+-m\s+(?:unittest|pytest|py_compile|ruff|mypy)\b"),
     re.compile(r"^(?:mpirun|mpiexec|orterun|prterun)\b(?![^;&|]*(?:\b(?:ba|z|da|k)?sh\b|\bpython3?\s+-c\b|\bperl\s+-e\b|\bruby\s+-e\b|\bnode\s+-e\b))"),
     re.compile(r"^(?:cmake|ctest|ninja|make)\b"),
     re.compile(r"^(?:clang\+\+|clang|g\+\+|gcc|nvcc|rustc|javac|javap)\b"),
@@ -167,7 +167,7 @@ SCOPED_CONTENT_SEGMENT_RE = re.compile(r"^(?:cat|head|tail|sed|awk|grep|rg|find|
 # Tier 1 path grants alone; they must always go to Tier 2 (LLM review against user messages) so
 # they are blocked unless the user explicitly asked to delete/reset them in the conversation.
 DESTRUCTIVE_SCOPE_COMMAND_RE = re.compile(
-    r"(?:^|[;&|]\s*|\s)(?:(?:\/bin\/)?rm\s+-[^\s]*[rR]|(?:\/bin\/)?rmdir\b|find\b[^;&|]*\s-delete\b|shutil\.rmtree|git\s+(?:-[Cc]\s+\S+\s+)?(?:reset\s+--hard|clean\s+-[^\s]*f|rm\s+-[^\s]*r\b))"
+    r"(?:^|[;&|]\s*|\s)(?:(?:/bin/)?rm\s+(?:-[^\s]+\s+)*(?:-[^\s]*[rR]|--recursive\b)|(?:/bin/)?rmdir\b|find\b[^;&|]*\s-delete\b|shutil\.rmtree|git\s+(?:-[Cc]\s+\S+\s+)?(?:reset\s+--hard|clean\s+(?:-[^\s]+\s+)*(?:-[^\s]*f|--force\b)|rm\s+(?:-[^\s]+\s+)*(?:-[^\s]*r\b|--recursive\b)))"
 )
 
 _GIT_WRITE_SUBCOMMANDS = frozenset(
@@ -1139,6 +1139,36 @@ def _dir_grant_candidates(path_str: str, include_self: bool = False, max_levels:
     return out
 
 
+def _has_cached_dir_grant(conversation_id: str, dir_path: str, needed_mode: str) -> bool:
+    write_verdict = get_cached_verdict(
+        conversation_id, compute_directory_grant_key(dir_path, "write")
+    )
+    if write_verdict is not None and write_verdict.get("effect") == "allow":
+        return True
+    if needed_mode == "read":
+        read_verdict = get_cached_verdict(
+            conversation_id, compute_directory_grant_key(dir_path, "read")
+        )
+        if read_verdict is not None and read_verdict.get("effect") == "allow":
+            return True
+    return False
+
+
+def _command_dir_cache_mode(sanitized_cmd: str, bypass_sandbox: bool) -> str:
+    if not bypass_sandbox:
+        return "read"
+    if _has_non_discard_file_redirect(sanitized_cmd):
+        return "write"
+    for seg in split_shell_segments(sanitized_cmd):
+        cleaned_seg = _strip_path_env_in_segment(seg)
+        if not cleaned_seg:
+            continue
+        is_mut, _ = _is_git_segment_mutating(cleaned_seg)
+        if is_mut:
+            return "write"
+    return "read"
+
+
 def is_safe_scoped_path(path_str: str, norm_workspaces: list[str], artifact_dir: str) -> bool:
     if any(is_path_under(path_str, ws) for ws in norm_workspaces):
         return True
@@ -1344,11 +1374,13 @@ def check_tier1_ledger(
     cwd: str,
     ledger: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Tier 1: Zero-token check against verbal grants extracted from USER_INPUT steps."""
-    norm_workspaces = [normalize_path(p) for p in workspace_paths if p]
+    """Tier 1: Zero-token check against opt-in verbal grants extracted from USER_INPUT steps."""
     denied_paths: list[str] = ledger.get("denied_paths", [])
     path_grants: list[dict[str, Any]] = ledger.get("path_grants", [])
     command_grants: list[str] = ledger.get("command_grants", [])
+    if not denied_paths and not path_grants and not command_grants:
+        return None
+    norm_workspaces = [normalize_path(p) for p in workspace_paths if p]
 
     if tool_name in ("read_file", "write_file", "edit_file", "view_file", "write_to_file", "replace_file_content"):
         raw_path = str(
@@ -1411,11 +1443,15 @@ def check_tier1_ledger(
             and not is_path_under(p, "/tmp")
             and not is_path_under(p, "/private/tmp")
         ]
+        needs_write = _command_dir_cache_mode(cmd, bool(tool_args.get("BypassSandbox", False))) == "write"
         if (
             outside_paths
             and not DESTRUCTIVE_SCOPE_COMMAND_RE.search(cmd)
             and all(
-                any(is_path_under(op, pg["path"]) for pg in path_grants)
+                any(
+                    is_path_under(op, pg["path"]) and (not needs_write or pg["mode"] == "write")
+                    for pg in path_grants
+                )
                 for op in outside_paths
             )
         ):
@@ -1567,6 +1603,12 @@ def evaluate_tool_call(
                     "view_file",
                     "write_to_file",
                     "replace_file_content",
+                    "delete_file",
+                )
+                file_mode = (
+                    "write"
+                    if tool_name in ("write_file", "edit_file", "write_to_file", "replace_file_content", "delete_file")
+                    else "read"
                 )
                 dir_sig = (
                     compute_signature(
@@ -1582,6 +1624,7 @@ def evaluate_tool_call(
                 # non-destructive command only references external directories already approved in this session,
                 # or if a strictly read-only SSH command targets a host already approved in this session.
                 cmd_outside_dirs: list[str] = []
+                cmd_dir_mode = "read"
                 ssh_info: tuple[str, str] | None = None
                 if tool_name == "run_command":
                     cmd_str = str(tool_args.get("CommandLine", ""))
@@ -1589,6 +1632,7 @@ def evaluate_tool_call(
                     norm_ws = [normalize_path(p) for p in workspace_paths if p]
                     sanitized = strip_commit_message_literals(strip_purpose_comment(cmd_str))
                     ssh_info = _parse_ssh_invocation(sanitized)
+                    cmd_dir_mode = _command_dir_cache_mode(sanitized, bypass_sb)
                     if (
                         (is_routine_command_segments(cmd_str, norm_workspaces=norm_ws) or not bypass_sb)
                         and not DESTRUCTIVE_SCOPE_COMMAND_RE.search(sanitized)
@@ -1619,14 +1663,13 @@ def evaluate_tool_call(
                     if raw_p:
                         norm_p = normalize_path(raw_p, cwd=cwd)
                         for cd in _dir_grant_candidates(norm_p, include_self=False, max_levels=4):
-                            dir_verdict = get_cached_verdict(conversation_id, compute_directory_grant_key(cd))
-                            if dir_verdict is not None and dir_verdict.get("effect") == "allow":
+                            if _has_cached_dir_grant(conversation_id, cd, file_mode):
                                 cached = {
                                     "effect": "allow",
                                     "source": "cache",
                                     "model": "session_dir_cache",
                                     "reasonCode": "cached_dir_grant",
-                                    "reason": "File operation targets a repository/directory already approved in this session.",
+                                    "reason": f"File operation ({file_mode}) targets a repository/directory already approved in this session.",
                                 }
                                 break
                 if cached is None and cmd_outside_dirs:
@@ -1635,7 +1678,7 @@ def evaluate_tool_call(
                     for op in cmd_outside_dirs:
                         cand_dirs = _dir_grant_candidates(op, include_self=True, max_levels=4)
                         if not cand_dirs or not any(
-                            (get_cached_verdict(conversation_id, compute_directory_grant_key(cd)) or {}).get("effect") == "allow"
+                            _has_cached_dir_grant(conversation_id, cd, cmd_dir_mode)
                             for cd in cand_dirs
                         ):
                             all_dirs_approved = False
@@ -1646,7 +1689,7 @@ def evaluate_tool_call(
                             "source": "cache",
                             "model": "session_dir_cache",
                             "reasonCode": "cached_dir_grant",
-                            "reason": "Routine command targets an external directory already approved in this session.",
+                            "reason": f"Routine command ({cmd_dir_mode}) targets an external directory already approved in this session.",
                         }
                 if (
                     cached is None
@@ -1768,34 +1811,35 @@ def evaluate_tool_call(
                 if verdict.get("effect") == "allow":
                     if dir_sig is not None:
                         put_cached_verdict(conversation_id, dir_sig, verdict)
-                    if is_file_tool:
-                        raw_p = str(
-                            tool_args.get("Path")
-                            or tool_args.get("TargetFile")
-                            or tool_args.get("AbsolutePath")
-                            or ""
-                        )
-                        if raw_p:
-                            norm_p = normalize_path(raw_p, cwd=cwd)
-                            for cd in _dir_grant_candidates(norm_p, include_self=False, max_levels=2):
+                    if cached is None:
+                        if is_file_tool:
+                            raw_p = str(
+                                tool_args.get("Path")
+                                or tool_args.get("TargetFile")
+                                or tool_args.get("AbsolutePath")
+                                or ""
+                            )
+                            if raw_p:
+                                norm_p = normalize_path(raw_p, cwd=cwd)
+                                for cd in _dir_grant_candidates(norm_p, include_self=False, max_levels=2):
+                                    put_cached_verdict(
+                                        conversation_id,
+                                        compute_directory_grant_key(cd, file_mode),
+                                        verdict,
+                                    )
+                        for op in cmd_outside_dirs:
+                            for cd in _dir_grant_candidates(op, include_self=True, max_levels=1):
                                 put_cached_verdict(
                                     conversation_id,
-                                    compute_directory_grant_key(cd),
+                                    compute_directory_grant_key(cd, cmd_dir_mode),
                                     verdict,
                                 )
-                    for op in cmd_outside_dirs:
-                        for cd in _dir_grant_candidates(op, include_self=True, max_levels=1):
+                        if ssh_info is not None:
                             put_cached_verdict(
                                 conversation_id,
-                                compute_directory_grant_key(cd),
+                                compute_ssh_host_grant_key(ssh_info[0]),
                                 verdict,
                             )
-                    if ssh_info is not None and cached is None:
-                        put_cached_verdict(
-                            conversation_id,
-                            compute_ssh_host_grant_key(ssh_info[0]),
-                            verdict,
-                        )
 
                 unresolved_mode = os.environ.get("AGY_UNRESOLVED_MODE", "agent")
                 max_sb = int(os.environ.get("AGY_MAX_SEND_BACKS", str(DEFAULT_MAX_SEND_BACKS)))

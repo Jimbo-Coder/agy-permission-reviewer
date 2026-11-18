@@ -20,6 +20,7 @@ from typing import Any
 
 USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.DOTALL)
 PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9._\-:/)\]])(?:~|/(?!/)|\.\./)[A-Za-z0-9._/\-]+")
+PROSE_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9._\-:/)\]])(?:~/|/(?!/)|\.\./)[A-Za-z0-9._/\-]+")
 
 NEGATIVE_CUE_RE = re.compile(
     r"\b(?:do\s+not|don't|never|avoid|forbid|prohibit|except|not\s+touch|hands\s+off)\b",
@@ -61,6 +62,25 @@ def normalize_path(path_str: str, cwd: str = "") -> str:
     return os.path.normpath(expanded)
 
 
+def _is_valid_prose_grant_target(norm_path: str) -> bool:
+    """Reject root/home/shallow system dirs so accidental mentions cannot mint broad grants."""
+    p = Path(norm_path)
+    if not p.is_absolute():
+        return False
+    if is_path_under(norm_path, "/private/tmp"):
+        return len(p.parts) >= 4
+    if is_path_under(norm_path, "/tmp"):
+        return len(p.parts) >= 3
+    home = Path.home()
+    try:
+        if p == home or p.resolve() == home.resolve():
+            return False
+    except OSError:
+        if p == home:
+            return False
+    return len(p.parts) >= 3
+
+
 def extract_grants_from_text(
     text: str,
     step_index: int = 0,
@@ -82,31 +102,32 @@ def extract_grants_from_text(
         has_write = bool(WRITE_GRANT_CUE_RE.search(clause))
         has_read = bool(READ_GRANT_CUE_RE.search(clause))
 
-        for match in PATH_TOKEN_RE.finditer(clause):
-            raw_path = match.group(0)
-            if len(raw_path) < 3:
-                continue
-            # Single-segment `/word` tokens in prose are chat slash commands (`/compact`, `/config`, `/settings`),
-            # not root filesystem grants, unless the user includes a second slash or Known Top-Level OS Dir.
-            if (
-                raw_path.startswith("/")
-                and "/" not in raw_path[1:]
-                and raw_path not in ("/tmp", "/opt", "/var", "/usr", "/etc", "/Users", "/Volumes", "/Library")
-            ):
-                continue
-            norm = normalize_path(raw_path, cwd=cwd)
-            if has_neg and not is_ro:
-                denied_paths.append(norm)
-                continue
-            mode = "read" if (is_ro or (has_read and not has_write)) else "write"
-            path_grants.append(
-                {
-                    "path": norm,
-                    "mode": mode,
-                    "step_index": step_index,
-                    "clause": clause[:160],
-                }
-            )
+        if has_neg or is_ro or has_write or has_read:
+            for match in PROSE_PATH_TOKEN_RE.finditer(clause):
+                raw_path = match.group(0)
+                if len(raw_path) < 3:
+                    continue
+                if (
+                    raw_path.startswith("/")
+                    and "/" not in raw_path[1:]
+                    and raw_path not in ("/tmp", "/opt", "/var", "/usr", "/etc", "/Users", "/Volumes", "/Library")
+                ):
+                    continue
+                norm = normalize_path(raw_path, cwd=cwd)
+                if not _is_valid_prose_grant_target(norm):
+                    continue
+                if has_neg and not is_ro:
+                    denied_paths.append(norm)
+                    continue
+                mode = "write" if (has_write and not is_ro and not has_neg) else "read"
+                path_grants.append(
+                    {
+                        "path": norm,
+                        "mode": mode,
+                        "step_index": step_index,
+                        "clause": clause[:160],
+                    }
+                )
 
         if not has_neg:
             for cmd_key, pat in COMMAND_GRANT_PATTERNS:
@@ -346,19 +367,27 @@ def collect_session_ledger(
     denied_set: set[str] = set()
     commands_set: set[str] = set()
 
-    # Security invariant: Tier-1 deterministic path/command grants ONLY scan clean user text, never agent output.
-    for step_idx, msg, _, _ in user_messages:
-        extracted = extract_grants_from_text(msg, step_index=step_idx, cwd=cwd)
-        for dp in extracted["denied_paths"]:
-            denied_set.add(dp)
-            path_map.pop(dp, None)
-        for pg in extracted["path_grants"]:
-            p = pg["path"]
-            if p in denied_set:
-                continue
-            path_map[p] = pg
-        for cg in extracted["command_grants"]:
-            commands_set.add(cg)
+    # Regex prose-grant extraction is disabled by default (Layer 2 LLM + session_dir_cache handles natural language);
+    # opt in via AGY_ENABLE_PROSE_LEDGER=1 only if desired. Still scans strictly clean user text, never agent output.
+    enable_prose_ledger = os.environ.get("AGY_ENABLE_PROSE_LEDGER", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if enable_prose_ledger:
+        for step_idx, msg, _, _ in user_messages:
+            extracted = extract_grants_from_text(msg, step_index=step_idx, cwd=cwd)
+            for dp in extracted["denied_paths"]:
+                denied_set.add(dp)
+                path_map.pop(dp, None)
+            for pg in extracted["path_grants"]:
+                p = pg["path"]
+                if p in denied_set:
+                    continue
+                path_map[p] = pg
+            for cg in extracted["command_grants"]:
+                commands_set.add(cg)
 
     recent_msgs = select_active_user_messages(user_messages)
     if checkpoint_summaries and not recent_msgs:
