@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -853,6 +854,183 @@ class TestPermissionReviewer(unittest.TestCase):
                 cwd=ws,
             )
             self.assertTrue(act["details"]["isDestructiveOrDelete"])
+
+    def test_stdlib_shlex_and_ast_command_path_extraction(self) -> None:
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        ws = "/workspace/project"
+
+        def fail_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            raise AssertionError(f"Tier 2 should not run for safe Tier 0 command ({endpoint})")
+
+        # 1. False-positive eliminations (Tier 0 fast-allow, 0 LLM calls)
+        fast_allow_cases = [
+            (
+                "python3 -c 'vals=[1,2]; total=10; users=2; "
+                "print((sum(vals))/1000.0, (total)/users, \"/\".join([\"a\",\"b\"]), len(vals) > 0)'",
+                False,
+            ),
+            (
+                "python3 - <<'PY'\nvals = [10, 20]\nprint(sum(vals) / 1000.0)\nPY",
+                False,
+            ),
+            (
+                "cat <<'EOF' > /tmp/notes.md\ndon't worry about /etc/hosts or 10/2.0\nEOF",
+                False,
+            ),
+            ("sed '/debug/d' src/a.py", False),
+            ("sed -i '' '/debug/d' src/a.py", False),
+            ("awk '/error/ {print $1/1000}' src/app.log", False),
+            ("/opt/homebrew/bin/gh api repos/org/repo/pulls/1 --jq '.items | length'", True),
+            ("/opt/homebrew/bin/gh api repos/org/repo/pulls/1 --jq '.commits > 0'", True),
+            ("/opt/homebrew/bin/uv run pytest 2>/dev/null", True),
+            ("ls /workspace/project # don't break on apostrophe in comment", False),
+        ]
+        for cmd, bypass in fast_allow_cases:
+            res = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_stdlib_ok",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd, "BypassSandbox": bypass}},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(res["decision"], "allow", msg=f"Expected Tier 0 allow for {cmd!r}, got {res}")
+            self.assertIn("Tier 0", res["reason"], msg=f"Expected Tier 0 reason for {cmd!r}, got {res}")
+
+        # 2. Security upgrades & fail-closed boundaries (must reach Tier 2, never fast-allow at Tier 0)
+        calls: list[dict] = []
+
+        def capture_allow(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            calls.append(payload)
+            return {"data": {"answers": [{"choice": "allow", "confidence": 0.96}]}}
+
+        def capture_deny(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            calls.append(payload)
+            return {"data": {"answers": [{"choice": "deny", "confidence": 0.97}]}}
+
+        # Path.home() / ".ssh" / "id_ed25519" must be resolved by AST and caught by SENSITIVE_READ_PATHS
+        calls.clear()
+        res_ssh = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_stdlib_sec",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": (
+                            'python3 -c \'from pathlib import Path; '
+                            'print((Path.home() / ".ssh" / "id_ed25519").read_text())\''
+                        ),
+                        "BypassSandbox": False,
+                    },
+                },
+            },
+            api_caller=capture_deny,
+        )
+        self.assertEqual(res_ssh["decision"], "deny")
+        self.assertEqual(len(calls), 1, msg="Path.home()/.ssh bypassed Tier 2!")
+
+        # Path("/opt") / "ext_proj" / "a.py" hits Tier 2 on first call, then os.path.join hits session_dir_cache
+        calls.clear()
+        res_path_obj = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_stdlib_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": (
+                            'python3 -c \'from pathlib import Path; '
+                            'print((Path("/opt") / "ext_proj" / "a.py").read_text())\''
+                        ),
+                        "BypassSandbox": False,
+                    },
+                },
+            },
+            api_caller=capture_allow,
+        )
+        self.assertEqual(res_path_obj["decision"], "allow")
+        self.assertEqual(len(calls), 1)
+
+        res_join_cached = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_stdlib_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": (
+                            'python3 -c \'import os; '
+                            'print(open(os.path.join("/opt", "ext_proj", "b.py")).read())\''
+                        ),
+                        "BypassSandbox": False,
+                    },
+                },
+            },
+            api_caller=capture_allow,
+        )
+        self.assertEqual(res_join_cached["decision"], "allow")
+        self.assertEqual(len(calls), 1, msg="Expected os.path.join on approved dir to reuse session_dir_cache")
+
+        # Remaining external path extraction & malformed fail-closed cases must reach Tier 2
+        tier2_required = [
+            'python3 -c \'open("/" + "etc/passwd")\'',
+            'python3 -c \'name="a"; open(f"/opt/other_ext/{name}.py")\'',
+            "sed '1w /outside/out.txt' src/a.py",
+            'awk \'{print > "/outside/out.txt"}\' src/app.log',
+            'cat "/outside/Folder With Spaces/secret.txt"',
+            "ls ~",
+            "cat < /outside/secret.txt",
+            'echo "unterminated /outside/secret',
+        ]
+        for cmd in tier2_required:
+            calls.clear()
+            res_req = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_stdlib_req",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd, "BypassSandbox": False}},
+                },
+                api_caller=capture_deny,
+            )
+            self.assertEqual(res_req["decision"], "deny", msg=f"Expected Tier 2 deny for {cmd!r}, got {res_req}")
+            self.assertEqual(len(calls), 1, msg=f"{cmd!r} failed to escalate to Tier 2")
+
+        # Quoted path with spaces stays intact in externalPaths rather than splitting on whitespace
+        act_spaces = review_hook.build_requested_action(
+            "run_command",
+            {"CommandLine": 'cat "/outside/Folder With Spaces/secret.txt"', "BypassSandbox": False},
+            workspace_paths=[ws],
+            cwd=ws,
+        )
+        self.assertIn("/outside/Folder With Spaces/secret.txt", act_spaces["details"]["externalPaths"])
+
+        # 3. Cold-parse latency check: unique Tier-0 routine + inline python division commands average < 1.0 ms
+        bench_cmds = [
+            f"git status --short && ls {ws}/sub{idx} && python3 -c 'print(({idx}+10)/1000.0)'"
+            for idx in range(25)
+        ]
+        intent_extractor.parse_shell_structure.cache_clear()
+        intent_extractor._extract_python_code_paths_cached.cache_clear()
+        t_start = time.perf_counter()
+        for cmd in bench_cmds:
+            res_b = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_stdlib_bench",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd, "BypassSandbox": False}},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(res_b["decision"], "allow")
+        avg_ms = ((time.perf_counter() - t_start) * 1000.0) / len(bench_cmds)
+        self.assertLess(avg_ms, 1.0, msg=f"Average Tier 0 evaluation latency too high: {avg_ms:.3f} ms")
 
 
 if __name__ == "__main__":

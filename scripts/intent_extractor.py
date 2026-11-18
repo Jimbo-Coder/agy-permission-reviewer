@@ -8,11 +8,13 @@ Distinguishes read-only vs read-write grants and honors negative prohibitions.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import tempfile
 from typing import Any
 
@@ -377,3 +379,483 @@ def is_path_under(target: str, parent: str) -> bool:
     if t == p:
         return True
     return t.startswith(p.rstrip("/") + "/")
+
+
+_URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+_SHELL_META_CHARS = frozenset("\"'\\;&|<>()\n#")
+_PUNCT_CHARS = "();<>|&\n"
+_SHELL_OP_RE = re.compile(r"&>>|&>|>>|<<<|<<|<&|<>|>&|>\||\|\||&&|\|&|[();<>|&\n]")
+_REDIRECT_OPS = frozenset({"<", ">", ">>", "&>", "&>>", "<>", ">|", "<&", ">&", "<<<"})
+_OUTPUT_REDIRECT_OPS = frozenset({">", ">>", "&>", "&>>", "<>", ">|", ">&"})
+_HEREDOC_TAIL_RE = re.compile(
+    r"(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|((?:\\.|[^\s;&|<>()#\"'])+))"
+)
+
+
+def extract_paths_from_string(
+    s: str,
+    cwd: str = "",
+    allow_bare_tilde_or_root: bool = False,
+) -> list[str]:
+    """Extract normalized filesystem paths from a shell argument or Python string value."""
+    if not s:
+        return []
+    if s.startswith(("@/", "@~/", "@../")):
+        s = s[1:]
+    if _URL_SCHEME_RE.match(s):
+        low = s.lower()
+        if low.startswith("file://localhost/"):
+            s = s[16:]
+        elif low.startswith("file://"):
+            s = s[7:]
+        else:
+            return []
+        if not s:
+            return []
+    if allow_bare_tilde_or_root and s in ("~", "/", ".."):
+        return [normalize_path(s, cwd=cwd)]
+    if s in ("~", ".."):
+        return [normalize_path(s, cwd=cwd)]
+    if (
+        s.startswith(("/", "~/", "../"))
+        and not s.startswith("//")
+        and "\n" not in s
+        and len(s.strip("/")) > 0
+    ):
+        if " " not in s and "\t" not in s:
+            return [normalize_path(s, cwd=cwd)]
+        has_shell_op = any(op in s for op in ("&&", "||", ";", "|"))
+        has_whitespace_path = any(
+            m.start() > 0 and s[m.start() - 1].isspace()
+            for m in PATH_TOKEN_RE.finditer(s)
+        )
+        if not has_shell_op and not has_whitespace_path:
+            return [normalize_path(s, cwd=cwd)]
+    return [
+        normalize_path(m.group(0), cwd=cwd)
+        for m in PATH_TOKEN_RE.finditer(s)
+        if len(m.group(0)) >= 3
+    ]
+
+
+@functools.lru_cache(maxsize=64)
+def _extract_python_code_paths_cached(code_str: str, cwd: str = "") -> tuple[str, ...]:
+    """Parse Python inline code with `ast` to distinguish math division from Path/string paths."""
+    import ast
+
+    try:
+        tree = ast.parse(code_str)
+    except (SyntaxError, ValueError, RecursionError):
+        return tuple(
+            normalize_path(m.group(0), cwd=cwd)
+            for m in PATH_TOKEN_RE.finditer(code_str)
+            if len(m.group(0)) >= 3
+        )
+
+    def _call_name(func_node: ast.AST) -> str:
+        parts: list[str] = []
+        cur: ast.AST | None = func_node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+            parts.reverse()
+            return ".".join(parts)
+        return ""
+
+    def _join_path_parts(parts_res: list[tuple[str, bool, list[ast.AST]] | None], raw_args: list[ast.AST]) -> tuple[str, list[ast.AST]]:
+        cur = ""
+        extra: list[ast.AST] = []
+        for idx, (res, raw_node) in enumerate(zip(parts_res, raw_args)):
+            if res is None:
+                seg = "__EXPR__"
+                extra.append(raw_node)
+            else:
+                seg = res[0]
+                extra.extend(res[2])
+            if not seg:
+                continue
+            if idx == 0:
+                cur = seg
+            elif seg.startswith("/"):
+                cur = seg
+            elif cur == "/":
+                cur = f"/{seg}"
+            elif not cur or cur == ".":
+                cur = seg
+            else:
+                cur = f"{cur.rstrip('/')}/{seg}"
+        return cur, extra
+
+    def _eval_node(node: ast.AST) -> tuple[str, bool, list[ast.AST]] | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value, False, []
+
+        if isinstance(node, ast.JoinedStr):
+            chunks: list[str] = []
+            extra: list[ast.AST] = []
+            for v in node.values:
+                if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                    chunks.append(v.value)
+                elif isinstance(v, ast.FormattedValue):
+                    fv_res = _eval_node(v.value)
+                    if fv_res is not None:
+                        chunks.append(fv_res[0])
+                        extra.extend(fv_res[2])
+                    else:
+                        chunks.append("__EXPR__")
+                        extra.append(v.value)
+            return "".join(chunks), False, extra
+
+        if isinstance(node, ast.Call) and not node.keywords and not any(isinstance(a, ast.Starred) for a in node.args):
+            cname = _call_name(node.func)
+            if cname in ("Path.home", "pathlib.Path.home") and not node.args:
+                return "~", True, []
+            if cname in ("Path", "PurePath", "PosixPath", "PurePosixPath", "pathlib.Path", "pathlib.PurePath", "pathlib.PosixPath", "pathlib.PurePosixPath"):
+                if not node.args:
+                    return ".", True, []
+                arg_evals = [_eval_node(a) for a in node.args]
+                if arg_evals[0] is not None:
+                    joined, extra = _join_path_parts(arg_evals, list(node.args))
+                    return joined or ".", True, extra
+            if cname in ("os.path.join", "posixpath.join") and node.args:
+                arg_evals = [_eval_node(a) for a in node.args]
+                if arg_evals[0] is not None and not arg_evals[0][1]:
+                    joined, extra = _join_path_parts(arg_evals, list(node.args))
+                    return joined, False, extra
+            if cname in ("os.path.expanduser", "posixpath.expanduser") and len(node.args) == 1:
+                arg_res = _eval_node(node.args[0])
+                if arg_res is not None:
+                    return arg_res
+
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Div):
+                l_res = _eval_node(node.left)
+                r_res = _eval_node(node.right)
+                # Only treat `/` as path joining when at least one side is a Path object.
+                if (l_res and l_res[1]) or (r_res and r_res[1]):
+                    extra: list[ast.AST] = []
+                    if l_res is None:
+                        l_str = "__EXPR__"
+                        extra.append(node.left)
+                    else:
+                        l_str = l_res[0]
+                        extra.extend(l_res[2])
+                    if r_res is None:
+                        r_str = "__EXPR__"
+                        extra.append(node.right)
+                    else:
+                        r_str = r_res[0]
+                        extra.extend(r_res[2])
+                    if r_str.startswith("/"):
+                        joined = r_str
+                    elif l_str == "/":
+                        joined = f"/{r_str}"
+                    elif not l_str or l_str == ".":
+                        joined = r_str
+                    else:
+                        joined = f"{l_str.rstrip('/')}/{r_str}"
+                    return joined, True, extra
+
+            if isinstance(node.op, ast.Add):
+                l_res = _eval_node(node.left)
+                r_res = _eval_node(node.right)
+                if l_res is not None and r_res is not None and not l_res[1] and not r_res[1]:
+                    return l_res[0] + r_res[0], False, l_res[2] + r_res[2]
+                if (
+                    l_res is not None
+                    and r_res is None
+                    and not l_res[1]
+                    and l_res[0].startswith(("/", "~/", "../"))
+                ):
+                    return l_res[0] + "__EXPR__", False, l_res[2] + [node.right]
+
+        return None
+
+    extracted: list[str] = []
+
+    def _walk(node: ast.AST) -> None:
+        res = _eval_node(node)
+        if res is not None:
+            s, is_path_obj, extra_nodes = res
+            found = extract_paths_from_string(s, cwd=cwd, allow_bare_tilde_or_root=is_path_obj)
+            if not found and is_path_obj and s not in ("", ".") and (bool(cwd) or s.startswith(("~", "/", ".."))):
+                found = [normalize_path(s, cwd=cwd)]
+            extracted.extend(found)
+            for ex in extra_nodes:
+                _walk(ex)
+            return
+        for child in ast.iter_child_nodes(node):
+            _walk(child)
+
+    _walk(tree)
+    return tuple(extracted)
+
+
+def extract_python_code_paths(code_str: str, cwd: str = "") -> list[str]:
+    """Return paths extracted from inline Python code via cached AST inspection."""
+    return list(_extract_python_code_paths_cached(code_str, cwd))
+
+
+def _scan_line_for_heredocs(
+    line: str,
+    in_sq: bool,
+    in_dq: bool,
+) -> tuple[list[tuple[bool, str]], bool, bool]:
+    """Scan one shell line for unquoted `<<` / `<<-` heredoc delimiters while tracking quotes."""
+    delims: list[tuple[bool, str]] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if in_sq:
+            if ch == "'":
+                in_sq = False
+            i += 1
+            continue
+        if in_dq:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_dq = False
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'":
+            in_sq = True
+            i += 1
+            continue
+        if ch == '"':
+            in_dq = True
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or line[i - 1].isspace() or line[i - 1] in ";|&()<>"):
+            break
+        if (
+            ch == "<"
+            and i + 1 < n
+            and line[i + 1] == "<"
+            and (i + 2 >= n or line[i + 2] != "<")
+            and (i == 0 or line[i - 1] != "<")
+        ):
+            hm = _HEREDOC_TAIL_RE.match(line[i + 2 :])
+            if hm:
+                strip_tabs = bool(hm.group(1))
+                delim = hm.group(2) or hm.group(3) or re.sub(r"\\(.)", r"\1", hm.group(4))
+                delims.append((strip_tabs, delim))
+                i += 2 + hm.end()
+                continue
+        i += 1
+    return delims, in_sq, in_dq
+
+
+def _split_heredocs(code_only: str) -> tuple[str, list[tuple[str, str]]]:
+    """Separate heredoc body blocks from shell header lines so literal bodies aren't lexed as shell."""
+    if "<<" not in code_only or "\n" not in code_only:
+        return code_only, []
+    lines = code_only.splitlines()
+    shell_lines: list[str] = []
+    heredocs: list[tuple[str, str]] = []
+    pending_delims: list[tuple[str, bool, str]] = []
+    cur_body: list[str] = []
+    in_sq = False
+    in_dq = False
+
+    for line in lines:
+        if pending_delims:
+            hdr, strip_tabs, delim = pending_delims[0]
+            cand = line.lstrip("\t") if strip_tabs else line
+            if cand == delim:
+                heredocs.append((hdr, "\n".join(cur_body)))
+                cur_body = []
+                pending_delims.pop(0)
+            else:
+                cur_body.append(line)
+            continue
+
+        shell_lines.append(line)
+        found, in_sq, in_dq = _scan_line_for_heredocs(line, in_sq, in_dq)
+        for strip_tabs, delim in found:
+            pending_delims.append((line, strip_tabs, delim))
+
+    if pending_delims:
+        hdr, _, _ = pending_delims[0]
+        heredocs.append((hdr, "\n".join(cur_body)))
+
+    return "\n".join(shell_lines), heredocs
+
+
+def _strip_shell_comments(text: str) -> str:
+    """Strip unquoted POSIX `# ...` comments so apostrophes inside comments never trip shlex."""
+    if "#" not in text:
+        return text
+    out: list[str] = []
+    in_sq = False
+    in_dq = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_sq:
+            out.append(ch)
+            if ch == "'":
+                in_sq = False
+            i += 1
+        elif in_dq:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_dq = False
+            i += 1
+        elif ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(text[i + 1])
+            i += 2
+        elif ch == "'":
+            in_sq = True
+            out.append(ch)
+            i += 1
+        elif ch == '"':
+            in_dq = True
+            out.append(ch)
+            i += 1
+        elif ch == "#" and (i == 0 or text[i - 1] in " \t\r\n;|&()<>"):
+            nl = text.find("\n", i)
+            if nl == -1:
+                break
+            i = nl
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=64)
+def parse_shell_structure(code_only: str) -> dict[str, Any] | None:
+    """Parse a shell command into immutable argv segments, raw segments, redirects, and heredocs.
+
+    Returns `None` on malformed shell syntax (e.g., unclosed quotes) so callers can fail closed.
+    """
+    if not code_only or not code_only.strip():
+        return {
+            "argv_segments": (),
+            "raw_segments": (),
+            "redirects": (),
+            "output_redirects": (),
+            "heredocs": (),
+        }
+    if not any(c in code_only for c in _SHELL_META_CHARS):
+        s = code_only.strip()
+        return {
+            "argv_segments": (tuple(s.split()),) if s else (),
+            "raw_segments": (s,) if s else (),
+            "redirects": (),
+            "output_redirects": (),
+            "heredocs": (),
+        }
+
+    cleaned_text, heredocs = _split_heredocs(code_only)
+    cleaned_text = _strip_shell_comments(cleaned_text)
+    lex = shlex.shlex(cleaned_text, posix=True, punctuation_chars=_PUNCT_CHARS)
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    lex.commenters = ""
+
+    argv_segments: list[tuple[str, ...]] = []
+    raw_segments: list[str] = []
+    redirects: list[tuple[str, str]] = []
+    output_redirects: list[tuple[str, str]] = []
+
+    cur_argv: list[str] = []
+    pending_op: str | None = None
+    seg_start = 0
+    prev_pos = 0
+
+    def _flush_segment(end_pos: int) -> None:
+        if cur_argv:
+            argv_segments.append(tuple(cur_argv))
+            cur_argv.clear()
+        raw_seg = cleaned_text[seg_start:end_pos].strip()
+        if raw_seg:
+            raw_segments.append(raw_seg)
+
+    try:
+        while True:
+            tok = lex.get_token()
+            if tok is lex.eof:
+                break
+            cur_pos = lex.instream.tell() - len(lex._pushback_chars)
+            raw_slice = cleaned_text[prev_pos:cur_pos]
+            tok_start = prev_pos
+            prev_pos = cur_pos
+
+            if tok == "\n" and raw_slice.strip(" \t\r") in ("\\\n", "\\\r\n"):
+                continue
+
+            stripped_raw = raw_slice.strip(" \t\r")
+            is_unquoted_op = (
+                bool(tok)
+                and all(c in _PUNCT_CHARS for c in tok)
+                and stripped_raw == tok
+            )
+
+            if not is_unquoted_op:
+                if pending_op is not None:
+                    op = pending_op
+                    pending_op = None
+                    if op in ("<<", "<<<"):
+                        continue
+                    if op in ("<&", ">&") and (tok.isdigit() or tok == "-"):
+                        continue
+                    redirects.append((op, tok))
+                    if op in _OUTPUT_REDIRECT_OPS:
+                        output_redirects.append((op, tok))
+                else:
+                    cur_argv.append(tok)
+                continue
+
+            ops = _SHELL_OP_RE.findall(tok)
+            if not ops:
+                continue
+            attached_left = bool(raw_slice) and not raw_slice[0].isspace()
+            if (
+                (ops[0] in _REDIRECT_OPS or ops[0] == "<<")
+                and attached_left
+                and cur_argv
+                and cur_argv[-1].isdigit()
+                and pending_op is None
+            ):
+                cur_argv.pop()
+
+            has_separator = any(op not in _REDIRECT_OPS and op != "<<" for op in ops)
+            for op in ops:
+                if op in _REDIRECT_OPS or op == "<<":
+                    pending_op = op
+                else:
+                    pending_op = None
+            if has_separator:
+                lead_ws = len(raw_slice) - len(raw_slice.lstrip(" \t\r"))
+                trail_ws = len(raw_slice) - len(raw_slice.rstrip(" \t\r"))
+                sep_start = tok_start + lead_ws
+                sep_end = cur_pos - trail_ws
+                _flush_segment(sep_start)
+                seg_start = sep_end
+
+    except ValueError:
+        return None
+
+    _flush_segment(len(cleaned_text))
+    return {
+        "argv_segments": tuple(argv_segments),
+        "raw_segments": tuple(raw_segments),
+        "redirects": tuple(redirects),
+        "output_redirects": tuple(output_redirects),
+        "heredocs": tuple(heredocs),
+    }

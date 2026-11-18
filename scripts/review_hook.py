@@ -32,9 +32,12 @@ from typing import Any
 from intent_extractor import (
     PATH_TOKEN_RE,
     collect_session_ledger,
+    extract_paths_from_string,
+    extract_python_code_paths,
     get_data_dir,
     is_path_under,
     normalize_path,
+    parse_shell_structure,
     safe_conv_id,
 )
 from llm_classifier import (
@@ -252,7 +255,7 @@ def _is_workspace_git_write(sanitized_cmd: str, norm_workspaces: list[str], cwd:
     """Return True if a `.git`-mutating command targets an active workspace repository (blocked in sandbox)."""
     if not norm_workspaces:
         return False
-    segments = [seg.strip() for seg in COMPOUND_SPLIT_RE.split(sanitized_cmd) if seg.strip()]
+    segments = split_shell_segments(sanitized_cmd)
     expanded: list[str] = []
     for raw_seg in segments:
         s = _strip_path_env_in_segment(raw_seg)
@@ -262,7 +265,7 @@ def _is_workspace_git_write(sanitized_cmd: str, norm_workspaces: list[str], cwd:
         if shell_m:
             expanded.extend(
                 _strip_path_env_in_segment(sub)
-                for sub in COMPOUND_SPLIT_RE.split(shell_m.group(2))
+                for sub in split_shell_segments(shell_m.group(2))
                 if sub.strip()
             )
         else:
@@ -449,35 +452,500 @@ def _strip_path_env_in_segment(seg: str) -> str:
     return s.strip()
 
 
-def _extract_command_ext_paths(code_only: str, cwd: str = "") -> list[str]:
-    """Extract path tokens from command segments while ignoring harmless `PATH=...` exports
-    and leading executable binary tokens in standard system bin directories.
-    """
-    paths: list[str] = []
-    for raw_seg in COMPOUND_SPLIT_RE.split(code_only):
-        seg = _strip_path_env_in_segment(raw_seg)
-        if not seg:
+_TRANSPARENT_WRAPPERS = frozenset({"env", "command", "nohup", "time", "nice"})
+_NESTED_SHELL_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_PYTHON_BIN_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
+_PYTHON_LAUNCHERS = frozenset({"uv", "mpirun", "mpiexec", "orterun", "prterun", "srun"})
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SED_FILE_CMD_RE = re.compile(r"(?:^|[;\s{\d$/])[wr]\s+([^\s;]+)")
+_AWK_DQ_STR_RE = re.compile(r'"((?:\\.|[^"\\])*)"')
+
+
+def split_shell_segments(code_only: str) -> list[str]:
+    parsed = parse_shell_structure(code_only)
+    if parsed is not None:
+        return list(parsed["raw_segments"])
+    return [seg.strip() for seg in COMPOUND_SPLIT_RE.split(code_only) if seg.strip()]
+
+
+def extract_shell_output_redirects(code_only: str) -> list[str]:
+    parsed = parse_shell_structure(code_only)
+    if parsed is not None:
+        return [
+            target
+            for _, target in parsed["output_redirects"]
+            if target not in DISCARD_REDIRECT_TARGETS
+        ]
+    return [
+        m.group(1).strip("\"'")
+        for m in OUTPUT_REDIRECT_RE.finditer(code_only)
+        if m.group(1).strip("\"'") not in DISCARD_REDIRECT_TARGETS
+    ]
+
+
+def _is_sensitive_path(norm_path: str) -> bool:
+    return any(is_path_under(norm_path, sp) for sp in SENSITIVE_READ_PATHS)
+
+
+def _append_exec_tok(tok: str, cwd: str, strip_std_bin: bool, out: list[str]) -> None:
+    if tok in ("~", "..") or tok.startswith(("/", "~/", "../")):
+        norm = normalize_path(tok, cwd=cwd)
+        if strip_std_bin and is_standard_bin_path(norm) and not _is_sensitive_path(norm):
+            return
+        out.append(norm)
+
+
+def _append_kv_or_arg(tok: str, cwd: str, out: list[str]) -> None:
+    if tok.startswith("--jq="):
+        return
+    if "=" in tok and not tok.startswith(("/", "~/", "../")):
+        _, rhs = tok.split("=", 1)
+        parts = rhs.split(":") if "://" not in rhs else [rhs]
+        for part in parts:
+            out.extend(extract_paths_from_string(part, cwd=cwd))
+        return
+    if re.match(r"^-[A-Za-z](?:/|~/|\.\./).+", tok):
+        out.append(normalize_path(tok[2:], cwd=cwd))
+        return
+    out.extend(extract_paths_from_string(tok, cwd=cwd))
+
+
+def _extract_default_args(args: tuple[str, ...], cwd: str, out: list[str]) -> None:
+    i = 0
+    n = len(args)
+    while i < n:
+        tok = args[i]
+        if tok == "--jq":
+            i += 2
             continue
-        m_cmd = re.match(r"^(\S+)(.*)$", seg, re.DOTALL)
-        if m_cmd:
-            cmd_tok, rest = m_cmd.group(1), m_cmd.group(2)
-            if cmd_tok.startswith(("/", "~", "../")):
-                norm_cmd = normalize_path(cmd_tok, cwd=cwd)
-                if is_standard_bin_path(norm_cmd) and not any(
-                    is_path_under(norm_cmd, sp) for sp in SENSITIVE_READ_PATHS
-                ):
-                    seg = rest.lstrip()
-        for pm in PATH_TOKEN_RE.finditer(seg):
-            if len(pm.group(0)) >= 3:
-                paths.append(normalize_path(pm.group(0), cwd=cwd))
+        _append_kv_or_arg(tok, cwd, out)
+        i += 1
+
+
+def _consume_leading_wrappers(
+    argv: tuple[str, ...],
+    cwd: str,
+    strip_std_bin: bool,
+    out: list[str],
+) -> int | None:
+    if not argv:
+        return None
+    idx = 0
+    n = len(argv)
+    if argv[0] == "export":
+        for tok in argv[1:]:
+            if _ENV_ASSIGN_RE.match(tok):
+                var, val = tok.split("=", 1)
+                if not (var == "PATH" and strip_std_bin):
+                    for part in (val.split(":") if "://" not in val else [val]):
+                        out.extend(extract_paths_from_string(part, cwd=cwd))
+            else:
+                _append_kv_or_arg(tok, cwd, out)
+        return None
+
+    while idx < n and _ENV_ASSIGN_RE.match(argv[idx]):
+        var, val = argv[idx].split("=", 1)
+        if not (var == "PATH" and strip_std_bin):
+            for part in (val.split(":") if "://" not in val else [val]):
+                out.extend(extract_paths_from_string(part, cwd=cwd))
+        idx += 1
+
+    while idx < n:
+        wname = Path(argv[idx]).name
+        if wname not in _TRANSPARENT_WRAPPERS:
+            break
+        _append_exec_tok(argv[idx], cwd, strip_std_bin, out)
+        idx += 1
+        if wname == "env":
+            while idx < n:
+                tok = argv[idx]
+                if tok in ("-i", "-0", "--ignore-environment", "--null", "--"):
+                    idx += 1
+                    if tok == "--":
+                        break
+                elif tok in ("-u", "--unset", "-C", "--chdir"):
+                    if tok in ("-C", "--chdir") and idx + 1 < n:
+                        _append_kv_or_arg(argv[idx + 1], cwd, out)
+                    idx += 2
+                elif tok.startswith("-") and tok != "-":
+                    idx += 1
+                elif _ENV_ASSIGN_RE.match(tok):
+                    var, val = tok.split("=", 1)
+                    if not (var == "PATH" and strip_std_bin):
+                        for part in (val.split(":") if "://" not in val else [val]):
+                            out.extend(extract_paths_from_string(part, cwd=cwd))
+                    idx += 1
+                else:
+                    break
+        elif wname == "nice":
+            if idx < n and argv[idx] == "-n" and idx + 1 < n:
+                idx += 2
+            elif idx < n and re.fullmatch(r"-\d+", argv[idx]):
+                idx += 1
+        elif wname == "command":
+            if idx < n and argv[idx] in ("-p", "--"):
+                idx += 1
+
+    return idx if idx < n else None
+
+
+def _extract_sed_args(args: tuple[str, ...], cwd: str, out: list[str]) -> None:
+    has_explicit_script = False
+    saw_positional_script = False
+    end_opts = False
+    i = 0
+    n = len(args)
+    while i < n:
+        tok = args[i]
+        if end_opts or not tok.startswith("-") or tok == "-":
+            if not has_explicit_script and not saw_positional_script:
+                saw_positional_script = True
+                for wm in _SED_FILE_CMD_RE.finditer(tok):
+                    out.extend(extract_paths_from_string(wm.group(1), cwd=cwd))
+            else:
+                _append_kv_or_arg(tok, cwd, out)
+            i += 1
+            continue
+        if tok == "--":
+            end_opts = True
+            i += 1
+            continue
+        if tok in ("-e", "--expression"):
+            has_explicit_script = True
+            if i + 1 < n:
+                for wm in _SED_FILE_CMD_RE.finditer(args[i + 1]):
+                    out.extend(extract_paths_from_string(wm.group(1), cwd=cwd))
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok.startswith("--expression=") or (tok.startswith("-e") and len(tok) > 2):
+            has_explicit_script = True
+            expr = tok.split("=", 1)[1] if tok.startswith("--") else tok[2:]
+            for wm in _SED_FILE_CMD_RE.finditer(expr):
+                out.extend(extract_paths_from_string(wm.group(1), cwd=cwd))
+            i += 1
+            continue
+        if tok in ("-f", "--file"):
+            has_explicit_script = True
+            if i + 1 < n:
+                _append_kv_or_arg(args[i + 1], cwd, out)
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok.startswith("--file=") or (tok.startswith("-f") and len(tok) > 2):
+            has_explicit_script = True
+            farg = tok.split("=", 1)[1] if tok.startswith("--") else tok[2:]
+            out.extend(extract_paths_from_string(farg, cwd=cwd))
+            i += 1
+            continue
+        if tok == "-i":
+            next_tok = args[i + 1] if i + 1 < n else None
+            rem_pos = 0
+            k = i + 1
+            while k < n:
+                if args[k] in ("-e", "--expression", "-f", "--file"):
+                    k += 2
+                    continue
+                if args[k] != "--" and not args[k].startswith("-"):
+                    rem_pos += 1
+                k += 1
+            if (
+                next_tok is not None
+                and (next_tok == "" or (next_tok.startswith(".") and "/" not in next_tok))
+                and rem_pos >= 2
+            ):
+                i += 2
+                continue
+        i += 1
+
+
+def _extract_awk_args(args: tuple[str, ...], cwd: str, out: list[str]) -> None:
+    has_prog_file = False
+    saw_inline_prog = False
+    end_opts = False
+    i = 0
+    n = len(args)
+    while i < n:
+        tok = args[i]
+        if end_opts or not tok.startswith("-") or tok == "-":
+            if not has_prog_file and not saw_inline_prog:
+                saw_inline_prog = True
+                for m in _AWK_DQ_STR_RE.finditer(tok):
+                    out.extend(extract_paths_from_string(m.group(1), cwd=cwd))
+            else:
+                _append_kv_or_arg(tok, cwd, out)
+            i += 1
+            continue
+        if tok == "--":
+            end_opts = True
+            i += 1
+            continue
+        if tok in ("-f", "--file"):
+            has_prog_file = True
+            if i + 1 < n:
+                _append_kv_or_arg(args[i + 1], cwd, out)
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok.startswith("--file=") or (tok.startswith("-f") and len(tok) > 2):
+            has_prog_file = True
+            farg = tok.split("=", 1)[1] if tok.startswith("--") else tok[2:]
+            out.extend(extract_paths_from_string(farg, cwd=cwd))
+            i += 1
+            continue
+        if tok in ("-F", "--field-separator"):
+            i += 2
+            continue
+        if tok in ("-v", "--assign"):
+            if i + 1 < n:
+                _append_kv_or_arg(args[i + 1], cwd, out)
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok.startswith("--assign=") or (tok.startswith("-v") and len(tok) > 2):
+            val = tok.split("=", 1)[1] if tok.startswith("--assign=") else tok[2:]
+            _append_kv_or_arg(val, cwd, out)
+            i += 1
+            continue
+        i += 1
+
+
+def _extract_jq_args(args: tuple[str, ...], cwd: str, out: list[str]) -> None:
+    has_filter_file = False
+    saw_inline_filter = False
+    end_opts = False
+    i = 0
+    n = len(args)
+    while i < n:
+        tok = args[i]
+        if end_opts or not tok.startswith("-") or tok == "-":
+            if not has_filter_file and not saw_inline_filter:
+                saw_inline_filter = True
+            else:
+                _append_kv_or_arg(tok, cwd, out)
+            i += 1
+            continue
+        if tok == "--":
+            end_opts = True
+            i += 1
+            continue
+        if tok in ("-f", "--from-file"):
+            has_filter_file = True
+            if i + 1 < n:
+                _append_kv_or_arg(args[i + 1], cwd, out)
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok.startswith("--from-file=") or (tok.startswith("-f") and len(tok) > 2):
+            has_filter_file = True
+            farg = tok.split("=", 1)[1] if tok.startswith("--from-file=") else tok[2:]
+            out.extend(extract_paths_from_string(farg, cwd=cwd))
+            i += 1
+            continue
+        if tok == "-L":
+            if i + 1 < n:
+                _append_kv_or_arg(args[i + 1], cwd, out)
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok.startswith("-L") and len(tok) > 2:
+            out.extend(extract_paths_from_string(tok[2:], cwd=cwd))
+            i += 1
+            continue
+        if tok in ("--arg", "--argjson", "--slurpfile", "--rawfile"):
+            if i + 2 < n:
+                _append_kv_or_arg(args[i + 2], cwd, out)
+                i += 3
+            else:
+                i = n
+            continue
+        i += 1
+
+
+def _extract_python_cmd_args(
+    argv: tuple[str, ...],
+    cmd_idx: int,
+    cmd_name: str,
+    cwd: str,
+    strip_std_bin: bool,
+    out: list[str],
+) -> bool:
+    if _PYTHON_BIN_RE.fullmatch(cmd_name):
+        py_idx: int | None = cmd_idx
+    elif cmd_name in _PYTHON_LAUNCHERS:
+        py_idx = None
+        for k in range(cmd_idx + 1, len(argv)):
+            if _PYTHON_BIN_RE.fullmatch(Path(argv[k]).name):
+                py_idx = k
+                break
+        if py_idx is None:
+            return False
+        for mid in argv[cmd_idx + 1 : py_idx]:
+            _append_kv_or_arg(mid, cwd, out)
+        _append_exec_tok(argv[py_idx], cwd, strip_std_bin, out)
+    else:
+        return False
+
+    k = py_idx + 1
+    n = len(argv)
+    while k < n:
+        tok = argv[k]
+        if tok in ("-W", "-X", "--check-hash-based-pycs"):
+            if k + 1 < n:
+                _append_kv_or_arg(argv[k + 1], cwd, out)
+                k += 2
+            else:
+                k += 1
+            continue
+        if tok == "-m" or not tok.startswith("-") or tok in ("-", "--"):
+            break
+        m_c = re.fullmatch(r"-[a-zA-Z]*c(.*)", tok)
+        if m_c and not tok.startswith("--"):
+            if m_c.group(1):
+                out.extend(extract_python_code_paths(m_c.group(1), cwd=cwd))
+                k += 1
+            elif k + 1 < n:
+                out.extend(extract_python_code_paths(argv[k + 1], cwd=cwd))
+                k += 2
+            else:
+                k += 1
+            break
+        k += 1
+
+    _extract_default_args(argv[k:], cwd, out)
+    return True
+
+
+def _extract_argv_paths(
+    argv: tuple[str, ...],
+    cwd: str,
+    strip_std_bin: bool,
+    out: list[str],
+    depth: int = 0,
+) -> None:
+    cmd_idx = _consume_leading_wrappers(argv, cwd, strip_std_bin, out)
+    if cmd_idx is None:
+        return
+    cmd_tok = argv[cmd_idx]
+    _append_exec_tok(cmd_tok, cwd, strip_std_bin, out)
+    cmd_name = Path(cmd_tok).name
+    rest = argv[cmd_idx + 1 :]
+
+    if cmd_name in _NESTED_SHELL_NAMES:
+        for j, tok in enumerate(rest):
+            if re.fullmatch(r"-[a-zA-Z]*c", tok) and j + 1 < len(rest):
+                _extract_default_args(rest[:j], cwd, out)
+                out.extend(
+                    _extract_command_ext_paths(
+                        rest[j + 1],
+                        cwd=cwd,
+                        strip_std_bin=strip_std_bin,
+                        _depth=depth + 1,
+                    )
+                )
+                _extract_default_args(rest[j + 2 :], cwd, out)
+                return
+
+    if _extract_python_cmd_args(argv, cmd_idx, cmd_name, cwd, strip_std_bin, out):
+        return
+
+    if cmd_name in ("sed", "gsed"):
+        _extract_sed_args(rest, cwd, out)
+    elif cmd_name in ("awk", "gawk", "nawk"):
+        _extract_awk_args(rest, cwd, out)
+    elif cmd_name == "jq":
+        _extract_jq_args(rest, cwd, out)
+    else:
+        _extract_default_args(rest, cwd, out)
+
+
+def _extract_command_ext_paths(
+    code_only: str,
+    cwd: str = "",
+    strip_std_bin: bool = True,
+    _depth: int = 0,
+) -> list[str]:
+    """Extract path tokens using stdlib `shlex` + Python `ast.parse`, failing closed on parse errors."""
+    if (
+        "/" not in code_only
+        and "~" not in code_only
+        and ".." not in code_only
+        and "python" not in code_only.lower()
+    ):
+        return []
+
+    parsed = parse_shell_structure(code_only)
+    if parsed is None or _depth > 4:
+        paths: list[str] = []
+        for raw_seg in COMPOUND_SPLIT_RE.split(code_only):
+            seg = _strip_path_env_in_segment(raw_seg)
+            if not seg:
+                continue
+            m_cmd = re.match(r"^(\S+)(.*)$", seg, re.DOTALL)
+            if m_cmd:
+                cmd_tok, rest = m_cmd.group(1), m_cmd.group(2)
+                if cmd_tok.startswith(("/", "~", "../")):
+                    norm_cmd = normalize_path(cmd_tok, cwd=cwd)
+                    if strip_std_bin and is_standard_bin_path(norm_cmd) and not _is_sensitive_path(norm_cmd):
+                        seg = rest.lstrip()
+            for pm in PATH_TOKEN_RE.finditer(seg):
+                if len(pm.group(0)) >= 3:
+                    paths.append(normalize_path(pm.group(0), cwd=cwd))
+        return paths
+
+    paths = []
+    for _, target in parsed["redirects"]:
+        if target in DISCARD_REDIRECT_TARGETS:
+            continue
+        paths.append(normalize_path(target, cwd=cwd))
+
+    for argv in parsed["argv_segments"]:
+        _extract_argv_paths(argv, cwd=cwd, strip_std_bin=strip_std_bin, out=paths, depth=_depth)
+
+    for header_line, body_text in parsed["heredocs"]:
+        if not body_text:
+            continue
+        head_part = header_line.split("<<", 1)[0].strip()
+        head_parsed = parse_shell_structure(head_part) if head_part else None
+        head_argvs = head_parsed["argv_segments"] if head_parsed is not None else ()
+        head_cmd = ""
+        if head_argvs:
+            tmp_out: list[str] = []
+            c_idx = _consume_leading_wrappers(head_argvs[-1], cwd, strip_std_bin, tmp_out)
+            if c_idx is not None:
+                head_cmd = Path(head_argvs[-1][c_idx]).name
+        if _PYTHON_BIN_RE.fullmatch(head_cmd):
+            paths.extend(extract_python_code_paths(body_text, cwd=cwd))
+        elif head_cmd in _NESTED_SHELL_NAMES:
+            paths.extend(
+                _extract_command_ext_paths(
+                    body_text,
+                    cwd=cwd,
+                    strip_std_bin=strip_std_bin,
+                    _depth=_depth + 1,
+                )
+            )
+        elif head_cmd in ("cat", "tee") and len(head_argvs) == 1 and "|" not in header_line:
+            continue
+        else:
+            for pm in PATH_TOKEN_RE.finditer(body_text):
+                if len(pm.group(0)) >= 3:
+                    paths.append(normalize_path(pm.group(0), cwd=cwd))
+
     return paths
 
 
 def _normalize_segment_for_routine(seg: str, norm_workspaces: list[str] | None = None) -> str:
     s = _strip_path_env_in_segment(seg)
-    if not s:
+    if not s or s.startswith("#"):
         return "true"
-    s = re.sub(r"(?:\s+\d*>>?\s*(?:/dev/null|&1|&2))+\s*$", "", s).strip()
+    s = re.sub(r"(?:(?:\s+\d*|\b)>>?\s*/dev/null|\s+\d*>&\d+)+\s*$", "", s).strip()
     m_cmd = re.match(r"^(/\S+)(\s.*|$)", s, re.DOTALL)
     if m_cmd:
         cmd_tok, rest = m_cmd.group(1), m_cmd.group(2)
@@ -497,11 +965,7 @@ def _matches_routine_segment(norm_seg: str) -> bool:
 
 
 def _has_non_discard_file_redirect(code_only: str) -> bool:
-    for redir_match in OUTPUT_REDIRECT_RE.finditer(code_only):
-        target_tok = redir_match.group(1).strip("\"'")
-        if target_tok not in DISCARD_REDIRECT_TARGETS:
-            return True
-    return False
+    return bool(extract_shell_output_redirects(code_only))
 
 
 def _dir_grant_candidates(path_str: str, include_self: bool = False, max_levels: int = 4) -> list[str]:
@@ -537,7 +1001,7 @@ def is_routine_command_segments(command: str, norm_workspaces: list[str] | None 
     code_only = strip_commit_message_literals(strip_purpose_comment(command))
     if not code_only or UNSAFE_SHELL_EXPANSION_RE.search(code_only) or _has_non_discard_file_redirect(code_only):
         return False
-    segments = [seg.strip() for seg in COMPOUND_SPLIT_RE.split(code_only) if seg.strip()]
+    segments = split_shell_segments(code_only)
     if not segments:
         return False
     return all(_matches_routine_segment(_normalize_segment_for_routine(seg, norm_workspaces)) for seg in segments)
@@ -560,32 +1024,25 @@ def is_fast_allow_command(
         return False, ""
 
     # Check output redirections: only allow redirects to /dev/null, &1/&2, or inside workspace/artifact/tmp
-    has_file_redirect = False
-    for redir_match in OUTPUT_REDIRECT_RE.finditer(code_only):
-        target_tok = redir_match.group(1).strip("\"'")
-        if target_tok in DISCARD_REDIRECT_TARGETS:
-            continue
-        has_file_redirect = True
+    output_redirects = extract_shell_output_redirects(code_only)
+    has_file_redirect = bool(output_redirects)
+    for target_tok in output_redirects:
         resolved = normalize_path(target_tok, cwd=cwd)
         if not is_safe_scoped_path(resolved, norm_workspaces, artifact_dir):
             return False, ""
 
     # Check sensitive read paths across all path tokens, and external paths excluding harmless std bin prefixes
-    all_raw_paths = [
-        normalize_path(m.group(0), cwd=cwd)
-        for m in PATH_TOKEN_RE.finditer(code_only)
-        if len(m.group(0)) >= 3
-    ]
+    all_raw_paths = _extract_command_ext_paths(code_only, cwd=cwd, strip_std_bin=False)
     for sp in SENSITIVE_READ_PATHS:
         if any(is_path_under(p, sp) for p in all_raw_paths):
             return False, ""
 
-    ext_paths = _extract_command_ext_paths(code_only, cwd=cwd)
+    ext_paths = _extract_command_ext_paths(code_only, cwd=cwd, strip_std_bin=True)
     outside_paths = [
         p for p in ext_paths if not is_safe_scoped_path(p, norm_workspaces, artifact_dir)
     ]
 
-    segments = [seg.strip() for seg in COMPOUND_SPLIT_RE.split(code_only) if seg.strip()]
+    segments = split_shell_segments(code_only)
     if not segments:
         return False, ""
 
@@ -780,11 +1237,7 @@ def check_tier1_ledger(
 
     if tool_name == "run_command":
         cmd = strip_commit_message_literals(strip_purpose_comment(str(tool_args.get("CommandLine", ""))))
-        raw_paths = [
-            normalize_path(m.group(0), cwd=cwd)
-            for m in PATH_TOKEN_RE.finditer(cmd)
-            if len(m.group(0)) >= 3
-        ]
+        raw_paths = _extract_command_ext_paths(cmd, cwd=cwd, strip_std_bin=False)
         for ep in raw_paths:
             for dp in denied_paths:
                 if is_path_under(ep, dp):
