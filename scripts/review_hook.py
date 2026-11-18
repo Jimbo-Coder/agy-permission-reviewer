@@ -38,7 +38,9 @@ from intent_extractor import (
 )
 from llm_classifier import (
     DEFAULT_DECISION_MODELS,
+    DEFAULT_DECISION_TIMEOUT_SEC,
     DEFAULT_ESCALATION_MODELS,
+    DEFAULT_ESCALATION_TIMEOUT_SEC,
     DEFAULT_MAX_SEND_BACKS,
     DEFAULT_MIN_CONFIDENCE,
     ROTATE_BYTES,
@@ -58,6 +60,52 @@ from llm_classifier import (
 UNSAFE_SHELL_EXPANSION_RE = re.compile(r"`|\$\(|<\(|>\(|\beval\s|\bexec\s")
 OUTPUT_REDIRECT_RE = re.compile(r"(?:^|\s)(?:\d*>>?|&>>?)\s*([^\s;&|]+)")
 COMPOUND_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
+DISCARD_REDIRECT_TARGETS = frozenset({"/dev/null", "&1", "&2"})
+
+REVIEWED_TOOLS = frozenset(
+    {
+        "run_command",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "view_file",
+        "write_to_file",
+        "replace_file_content",
+        "delete_file",
+        "call_mcp_tool",
+        "list_resources",
+        "read_resource",
+    }
+)
+REVIEWED_TOOL_PREFIXES = ("mcp_", "browser_")
+
+STANDARD_BIN_PATHS = (
+    "/bin",
+    "/usr/bin",
+    "/sbin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/opt/homebrew/Cellar",
+    "/opt/homebrew/opt",
+    "/Library/Developer/CommandLineTools/usr/bin",
+)
+
+_SEGMENT_CMD_PREFIX = (
+    r"(?:^|[;&|]\s*)"
+    r"(?:export\s+[^;&|]+;\s*|(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)\s+))*"
+    r"(?:/[\w./-]+/)?"
+)
+
+# Commands that inherently require outbound network and always fail inside the no-network sandbox
+NETWORK_REQUIRED_COMMAND_RE = re.compile(
+    _SEGMENT_CMD_PREFIX
+    + r"(?:git\s+(?:-C\s+\S+\s+)?(?:push|pull|fetch|ls-remote|clone\s+(?:https?://|ssh://|git@))\b"
+    + r"|gh\s+(?:pr|issue|release|gist|repo|run|api|workflow|search)\b"
+    + r"|ssh\s+(?!-[vV](?:\s|$))|scp\s+|sftp\s+"
+    + r"|(?:npm|pnpm|yarn|cargo|uv)\s+(?:npm\s+)?publish\b|twine\s+upload\b)"
+)
 
 # Read-only inspection, local test/build runners, and local git commands (never push/reset/clean).
 # Combined with `not outside_paths`, these fast-allow in <1 ms when all referenced paths are inside
@@ -67,13 +115,25 @@ ROUTINE_SEGMENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^uv\s+run\s+(?:python3?|pytest|ruff|mypy)\b"),
     re.compile(r"^python3?\s+(?:-m\s+(?:unittest|pytest|py_compile|ruff|mypy)\b|\S+\.py\b)"),
     re.compile(r"^(?:cmake|ctest|ninja|make)\b"),
+    re.compile(r"^(?:clang\+\+|clang|g\+\+|gcc|nvcc|rustc|javac|javap)\b"),
     re.compile(r"^(?:npm|pnpm|yarn|bun)\s+(?:test|run\s+(?:test|lint|build|typecheck|check))(?:\s|$)"),
     re.compile(r"^cargo\s+(?:test|check|build)(?:\s|$)"),
     re.compile(r"^go\s+test(?:\s|$)"),
     re.compile(r"^(?:pytest|ruff\s+check|tsc)(?:\s|$)"),
+    re.compile(r"^gh\s+(?:pr\s+(?:list|view|checks|diff|status)|issue\s+(?:list|view|status)|run\s+(?:list|view)|repo\s+view)(?:\s|$)"),
     re.compile(r"^(?:ls|tree|wc|du|df|stat|file|which|pwd|whoami|uname|uptime|nproc|sw_vers|true|false)(?:\s|$)"),
     re.compile(r"^(?:hostname|date)(?:\s+(?:-[sf]|\+\S+))?$"),
 ]
+
+_GH_API_MUTATION_FLAG_RE = re.compile(r"(?:\s|^)(?:-X|--method|-f|-F|--raw-field|--field|--input)\b")
+_GIT_COMMIT_SPAN_RE = re.compile(
+    r"""(?<![A-Za-z0-9_])(?:/[\w./-]+/)?git\s+(?:-[Cc]\s+\S+\s+)?commit\b(?:[^"'`;&|]+|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')*""",
+    re.DOTALL,
+)
+_GIT_COMMIT_MSG_FLAG_RE = re.compile(
+    r"""(\s(?:-[a-zA-Z]*m\s*|--message(?:=|\s+)))(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""",
+    re.DOTALL,
+)
 
 # Content-reading and scoped file cleanup commands fast-allow only when target paths are explicitly present and in-scope
 SCOPED_CONTENT_SEGMENT_RE = re.compile(r"^(?:cat|head|tail|sed|awk|grep|rg|find|sort|uniq|cut|tr|rm\s+-f)\b")
@@ -121,9 +181,9 @@ def load_local_config() -> dict[str, Any]:
         os.environ.get("AGY_PERMISSION_REVIEWER_LOCAL_CONFIG")
         or os.path.expanduser("~/.gemini/config/permission_reviewer.local.json")
     )
-    if not cfg_path.is_file():
-        return {}
     try:
+        if not cfg_path.is_file():
+            return {}
         data = json.loads(cfg_path.read_text(encoding="utf-8", errors="replace"))
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
@@ -154,16 +214,20 @@ FORCE_ASK_COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "GitHub issue/PR/review/comment/release/gist mutation requires explicit user confirmation",
         re.compile(
-            r"(?:^|[;&|]\s*)gh\s+(?:(?:issue|pr|release|gist)\s+(?:create|comment|edit|close|reopen|merge|review|delete|lock|unlock)|repo\s+(?:create|delete|edit|fork|rename|archive)|api\b[^;&|]*(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--method\s*(?:POST|PUT|PATCH|DELETE)|\s-[fF]\s))"
+            _SEGMENT_CMD_PREFIX
+            + r"gh\s+(?:(?:issue|pr|release|gist)\s+(?:create|comment|edit|close|reopen|merge|review|delete|lock|unlock)|repo\s+(?:create|delete|edit|fork|rename|archive)|api\b[^;&|]*(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--method\s*(?:POST|PUT|PATCH|DELETE)|\s-[fF]\s|--(?:raw-field|field|input)(?:=|\s)))"
         ),
     ),
     (
         "Pushing to a remote Git repository modifies external state and requires explicit user confirmation",
-        re.compile(r"(?:^|[;&|]\s*)git\s+(?:-C\s+\S+\s+)?push\b"),
+        re.compile(_SEGMENT_CMD_PREFIX + r"git\s+(?:-C\s+\S+\s+)?push\b"),
     ),
     (
         "Publishing to a public package registry requires explicit user confirmation",
-        re.compile(r"(?:^|[;&|]\s*)(?:npm\s+publish|pnpm\s+publish|yarn\s+(?:npm\s+)?publish|cargo\s+publish|twine\s+upload|uv\s+publish)\b"),
+        re.compile(
+            _SEGMENT_CMD_PREFIX
+            + r"(?:npm\s+publish|pnpm\s+publish|yarn\s+(?:npm\s+)?publish|cargo\s+publish|twine\s+upload|uv\s+publish)\b"
+        ),
     ),
 ]
 
@@ -227,14 +291,81 @@ def strip_purpose_comment(command: str) -> str:
 
 
 def strip_commit_message_literals(command: str) -> str:
-    """Replace `-m "..."` / `-am '...'` commit message literals so prose inside commit messages
-    (e.g. `git commit -am "Require force_ask on git push/registry"`) never triggers `git push` or path false positives.
+    """Replace all `-m "..."` / `--message=...` commit message literals in `git commit` segments
+    so prose inside commit messages never triggers `git push`, `gh`, or path false positives.
     """
-    return re.sub(
-        r"""(\bgit\s+(?:-C\s+\S+\s+)?commit\b[^;&|]*?\s-[a-zA-Z]*m\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""",
-        r'\1"__COMMIT_MSG__"',
+    return _GIT_COMMIT_SPAN_RE.sub(
+        lambda m: _GIT_COMMIT_MSG_FLAG_RE.sub(r'\1"__COMMIT_MSG__"', m.group(0)),
         command,
     )
+
+
+def is_standard_bin_path(path_str: str) -> bool:
+    return any(is_path_under(path_str, bp) for bp in STANDARD_BIN_PATHS)
+
+
+def _strip_path_env_in_segment(seg: str) -> str:
+    s = seg.strip()
+    if re.fullmatch(r"export\s+PATH=(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)", s):
+        return ""
+    s = re.sub(r"^(?:export\s+PATH=(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)\s*;\s*)+", "", s)
+    s = re.sub(r"^(?:PATH=(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)\s+)+", "", s)
+    return s.strip()
+
+
+def _extract_command_ext_paths(code_only: str, cwd: str = "") -> list[str]:
+    """Extract path tokens from command segments while ignoring harmless `PATH=...` exports
+    and leading executable binary tokens in standard system bin directories.
+    """
+    paths: list[str] = []
+    for raw_seg in COMPOUND_SPLIT_RE.split(code_only):
+        seg = _strip_path_env_in_segment(raw_seg)
+        if not seg:
+            continue
+        m_cmd = re.match(r"^(\S+)(.*)$", seg, re.DOTALL)
+        if m_cmd:
+            cmd_tok, rest = m_cmd.group(1), m_cmd.group(2)
+            if cmd_tok.startswith(("/", "~", "../")):
+                norm_cmd = normalize_path(cmd_tok, cwd=cwd)
+                if is_standard_bin_path(norm_cmd) and not any(
+                    is_path_under(norm_cmd, sp) for sp in SENSITIVE_READ_PATHS
+                ):
+                    seg = rest.lstrip()
+        for pm in PATH_TOKEN_RE.finditer(seg):
+            if len(pm.group(0)) >= 3:
+                paths.append(normalize_path(pm.group(0), cwd=cwd))
+    return paths
+
+
+def _normalize_segment_for_routine(seg: str, norm_workspaces: list[str] | None = None) -> str:
+    s = _strip_path_env_in_segment(seg)
+    if not s:
+        return "true"
+    s = re.sub(r"(?:\s+\d*>>?\s*(?:/dev/null|&1|&2))+\s*$", "", s).strip()
+    m_cmd = re.match(r"^(/\S+)(\s.*|$)", s, re.DOTALL)
+    if m_cmd:
+        cmd_tok, rest = m_cmd.group(1), m_cmd.group(2)
+        norm_cmd = normalize_path(cmd_tok)
+        in_ws = bool(norm_workspaces and any(is_path_under(norm_cmd, ws) for ws in norm_workspaces))
+        if is_standard_bin_path(norm_cmd) or in_ws:
+            s = Path(norm_cmd).name + rest
+    return s
+
+
+def _matches_routine_segment(norm_seg: str) -> bool:
+    if any(pat.search(norm_seg) for pat in ROUTINE_SEGMENT_PATTERNS):
+        return True
+    if re.match(r"^gh\s+api\b", norm_seg) and not _GH_API_MUTATION_FLAG_RE.search(norm_seg):
+        return True
+    return False
+
+
+def _has_non_discard_file_redirect(code_only: str) -> bool:
+    for redir_match in OUTPUT_REDIRECT_RE.finditer(code_only):
+        target_tok = redir_match.group(1).strip("\"'")
+        if target_tok not in DISCARD_REDIRECT_TARGETS:
+            return True
+    return False
 
 
 def is_safe_scoped_path(path_str: str, norm_workspaces: list[str], artifact_dir: str) -> bool:
@@ -251,14 +382,14 @@ def is_safe_scoped_path(path_str: str, norm_workspaces: list[str], artifact_dir:
     return False
 
 
-def is_routine_command_segments(command: str) -> bool:
+def is_routine_command_segments(command: str, norm_workspaces: list[str] | None = None) -> bool:
     code_only = strip_commit_message_literals(strip_purpose_comment(command))
-    if not code_only or UNSAFE_SHELL_EXPANSION_RE.search(code_only) or OUTPUT_REDIRECT_RE.search(code_only):
+    if not code_only or UNSAFE_SHELL_EXPANSION_RE.search(code_only) or _has_non_discard_file_redirect(code_only):
         return False
     segments = [seg.strip() for seg in COMPOUND_SPLIT_RE.split(code_only) if seg.strip()]
     if not segments:
         return False
-    return all(any(pat.search(seg) for pat in ROUTINE_SEGMENT_PATTERNS) for seg in segments)
+    return all(_matches_routine_segment(_normalize_segment_for_routine(seg, norm_workspaces)) for seg in segments)
 
 
 def is_fast_allow_command(
@@ -277,25 +408,28 @@ def is_fast_allow_command(
     ):
         return False, ""
 
-    # Check output redirections: only allow redirects to /dev/null or inside workspace/artifact/tmp
+    # Check output redirections: only allow redirects to /dev/null, &1/&2, or inside workspace/artifact/tmp
+    has_file_redirect = False
     for redir_match in OUTPUT_REDIRECT_RE.finditer(code_only):
         target_tok = redir_match.group(1).strip("\"'")
-        if target_tok in ("/dev/null", "&1", "&2"):
+        if target_tok in DISCARD_REDIRECT_TARGETS:
             continue
+        has_file_redirect = True
         resolved = normalize_path(target_tok, cwd=cwd)
         if not is_safe_scoped_path(resolved, norm_workspaces, artifact_dir):
             return False, ""
 
-    # Check all explicit path tokens in the command
-    ext_paths = [
+    # Check sensitive read paths across all path tokens, and external paths excluding harmless std bin prefixes
+    all_raw_paths = [
         normalize_path(m.group(0), cwd=cwd)
         for m in PATH_TOKEN_RE.finditer(code_only)
         if len(m.group(0)) >= 3
     ]
     for sp in SENSITIVE_READ_PATHS:
-        if any(is_path_under(p, sp) for p in ext_paths):
+        if any(is_path_under(p, sp) for p in all_raw_paths):
             return False, ""
 
+    ext_paths = _extract_command_ext_paths(code_only, cwd=cwd)
     outside_paths = [
         p for p in ext_paths if not is_safe_scoped_path(p, norm_workspaces, artifact_dir)
     ]
@@ -305,11 +439,11 @@ def is_fast_allow_command(
         return False, ""
 
     all_routine = all(
-        any(pat.search(seg) for pat in ROUTINE_SEGMENT_PATTERNS)
-        or (bool(ext_paths) and SCOPED_CONTENT_SEGMENT_RE.search(seg))
+        _matches_routine_segment(_normalize_segment_for_routine(seg, norm_workspaces))
+        or (bool(ext_paths) and bool(SCOPED_CONTENT_SEGMENT_RE.search(_normalize_segment_for_routine(seg, norm_workspaces))))
         for seg in segments
     )
-    if all_routine and not outside_paths and not OUTPUT_REDIRECT_RE.search(code_only):
+    if all_routine and not outside_paths and not has_file_redirect:
         return True, "[Tier 0 Policy] Routine read-only or local validation command."
 
     if not bypass_sandbox and not outside_paths:
@@ -326,6 +460,12 @@ def check_tier0_static(
     artifact_dir: str = "",
 ) -> dict[str, Any] | None:
     """Tier 0: Instant deterministic allow/deny (~1 ms)."""
+    if tool_name and tool_name not in REVIEWED_TOOLS and not tool_name.startswith(REVIEWED_TOOL_PREFIXES):
+        return {
+            "decision": "allow",
+            "reason": f"[Tier 0 Policy] Internal non-filesystem/non-shell tool ({tool_name}).",
+            "tier": "tier0_static",
+        }
     norm_workspaces = [normalize_path(p) for p in workspace_paths if p]
     local_cfg = load_local_config()
     extra_denied = [normalize_path(str(p)) for p in local_cfg.get("extra_denied_paths", []) if str(p).strip()]
@@ -384,6 +524,7 @@ def check_tier0_static(
 
     if tool_name == "run_command":
         cmd = str(tool_args.get("CommandLine", ""))
+        bypass_sandbox = bool(tool_args.get("BypassSandbox", False))
         sanitized_cmd = strip_commit_message_literals(strip_purpose_comment(cmd))
         for label, pat in list(HARD_DENY_COMMAND_PATTERNS) + build_local_hard_deny_patterns(local_cfg):
             if pat.search(sanitized_cmd):
@@ -392,6 +533,17 @@ def check_tier0_static(
                     "reason": f"[Tier 0 Policy] Blocked catastrophic command pattern: {label}.",
                     "tier": "tier0_static",
                 }
+        if not bypass_sandbox and NETWORK_REQUIRED_COMMAND_RE.search(sanitized_cmd):
+            return {
+                "decision": "deny",
+                "reason": (
+                    "[Tier 0 Policy] Command requires outbound network access and cannot succeed inside the "
+                    "no-network sandbox (BypassSandbox=false). Re-issue once with BypassSandbox=true "
+                    "(only after explicit user confirmation for public/remote mutations like git push or gh writes) "
+                    "so it is reviewed/approved only once."
+                ),
+                "tier": "tier0_sandbox_network_mismatch",
+            }
         for label, pat in FORCE_ASK_COMMAND_PATTERNS:
             if pat.search(sanitized_cmd):
                 return {
@@ -401,7 +553,7 @@ def check_tier0_static(
                 }
         ok, reason = is_fast_allow_command(
             command=cmd,
-            bypass_sandbox=bool(tool_args.get("BypassSandbox", False)),
+            bypass_sandbox=bypass_sandbox,
             norm_workspaces=norm_workspaces,
             artifact_dir=artifact_dir,
             cwd=cwd,
@@ -471,12 +623,12 @@ def check_tier1_ledger(
 
     if tool_name == "run_command":
         cmd = strip_commit_message_literals(strip_purpose_comment(str(tool_args.get("CommandLine", ""))))
-        ext_paths = [
+        raw_paths = [
             normalize_path(m.group(0), cwd=cwd)
             for m in PATH_TOKEN_RE.finditer(cmd)
             if len(m.group(0)) >= 3
         ]
-        for ep in ext_paths:
+        for ep in raw_paths:
             for dp in denied_paths:
                 if is_path_under(ep, dp):
                     return {
@@ -485,6 +637,7 @@ def check_tier1_ledger(
                         "tier": "tier1_ledger",
                     }
 
+        ext_paths = _extract_command_ext_paths(cmd, cwd=cwd)
         outside_paths = [
             p
             for p in ext_paths
@@ -544,11 +697,7 @@ def build_requested_action(
             r"#\s*purpose:\s*(.+?)(?=\s+#\s*auth:|$)", cmd, flags=re.IGNORECASE
         )
         code_only = strip_commit_message_literals(strip_purpose_comment(cmd))
-        ext_paths = [
-            normalize_path(m.group(0), cwd=cwd)
-            for m in PATH_TOKEN_RE.finditer(code_only)
-            if len(m.group(0)) >= 3
-        ]
+        ext_paths = _extract_command_ext_paths(code_only, cwd=cwd)
         outside_paths = [
             p for p in ext_paths if not is_safe_scoped_path(p, norm_workspaces, artifact_dir)
         ]
@@ -652,22 +801,26 @@ def evaluate_tool_call(
                     if is_file_tool
                     else None
                 )
-                # Also check if a routine command (`git -C <dir>`, `unittest -s <dir>`) only references
-                # external directories that have already been approved in this conversation.
+                # Also check if a routine command (`git -C <dir>`, `unittest -s <dir>`) or a sandboxed
+                # non-destructive command only references external directories already approved in this session.
                 cmd_outside_dirs: list[str] = []
                 if tool_name == "run_command":
                     cmd_str = str(tool_args.get("CommandLine", ""))
-                    if is_routine_command_segments(cmd_str):
-                        sanitized = strip_commit_message_literals(strip_purpose_comment(cmd_str))
-                        norm_ws = [normalize_path(p) for p in workspace_paths if p]
-                        ext_p = [
-                            normalize_path(m.group(0), cwd=cwd)
-                            for m in PATH_TOKEN_RE.finditer(sanitized)
-                            if len(m.group(0)) >= 3
-                        ]
-                        cmd_outside_dirs = [
-                            p for p in ext_p if not is_safe_scoped_path(p, norm_ws, artifact_dir)
-                        ]
+                    bypass_sb = bool(tool_args.get("BypassSandbox", False))
+                    norm_ws = [normalize_path(p) for p in workspace_paths if p]
+                    sanitized = strip_commit_message_literals(strip_purpose_comment(cmd_str))
+                    if (
+                        (is_routine_command_segments(cmd_str, norm_workspaces=norm_ws) or not bypass_sb)
+                        and not DESTRUCTIVE_SCOPE_COMMAND_RE.search(sanitized)
+                    ):
+                        ext_p = _extract_command_ext_paths(sanitized, cwd=cwd)
+                        if not any(
+                            any(is_path_under(p, sp) for sp in SENSITIVE_READ_PATHS)
+                            for p in ext_p
+                        ):
+                            cmd_outside_dirs = [
+                                p for p in ext_p if not is_safe_scoped_path(p, norm_ws, artifact_dir)
+                            ]
 
                 cached = get_cached_verdict(conversation_id, req_key)
                 if cached is None and dir_sig is not None:
@@ -742,6 +895,12 @@ def evaluate_tool_call(
                     min_conf = float(
                         os.environ.get("AGY_MIN_CONFIDENCE", str(DEFAULT_MIN_CONFIDENCE))
                     )
+                    decision_timeout = float(
+                        os.environ.get("AGY_DECISION_TIMEOUT_SEC", str(DEFAULT_DECISION_TIMEOUT_SEC))
+                    )
+                    escalation_timeout = float(
+                        os.environ.get("AGY_ESCALATION_TIMEOUT_SEC", str(DEFAULT_ESCALATION_TIMEOUT_SEC))
+                    )
                     kwargs = {"api_caller": api_caller} if api_caller is not None else {}
                     first = run_jev_decision_tier(
                         models=decision_models,
@@ -749,6 +908,7 @@ def evaluate_tool_call(
                         user_messages=ledger.get("recent_user_messages", []),
                         compact_transcript=compact_tx,
                         requested_action=requested_action,
+                        timeout_sec=decision_timeout,
                         **kwargs,
                     )
                     if first.get("effect") == "ask" and escalation_models:
@@ -756,13 +916,14 @@ def evaluate_tool_call(
                             transcript_path,
                             max_items=24,
                             max_chars=5500,
-                            include_thinking=False,
+                            include_thinking=True,
                         )
                         second = run_escalation_tier(
                             escalation_models=escalation_models,
                             requested_action=requested_action,
                             first_verdict=first,
                             compact_transcript=esc_tx or compact_tx,
+                            timeout_sec=escalation_timeout,
                             **kwargs,
                         )
                         verdict = second if second is not None else first

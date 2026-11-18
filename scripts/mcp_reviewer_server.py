@@ -128,13 +128,16 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                         audit_entries.append(json.loads(ln))
                     except Exception:
                         pass
-        usage_summary: dict[str, Any] = {"total_calls": 0, "by_model": {}, "by_outcome": {}}
+        usage_summary: dict[str, Any] = {"total_calls": 0, "total_cost_usd": 0.0, "by_model": {}, "by_outcome": {}}
         usage_file = base / "usage.jsonl"
         if usage_file.is_file():
             for ln in usage_file.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]:
                 try:
                     u = json.loads(ln)
                     usage_summary["total_calls"] += 1
+                    usage_summary["total_cost_usd"] = round(
+                        usage_summary["total_cost_usd"] + float(u.get("costUsd", 0.0)), 6
+                    )
                     m_key = str(u.get("model", "unknown"))
                     o_key = str(u.get("outcome", "unknown"))
                     usage_summary["by_model"][m_key] = usage_summary["by_model"].get(m_key, 0) + 1

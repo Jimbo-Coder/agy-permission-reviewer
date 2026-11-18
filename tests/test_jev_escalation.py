@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRATCH_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRATCH_DIR))
 sys.path.insert(0, str(SCRATCH_DIR.parent / "scripts"))
 
 import llm_classifier
+import mcp_reviewer_server
 import review_hook
 
 
@@ -258,6 +261,136 @@ class TestJevEscalationAndSendBack(unittest.TestCase):
         )
         self.assertFalse(action_fake["details"]["citedUserAuth"]["verifiedFromTranscript"])
         self.assertIn("NOT found", action_fake["details"]["citedUserAuth"]["warning"])
+
+    def test_paid_jev_failover_zero_waste_and_backoff(self) -> None:
+        tp = self._write_transcript(["Check the reference helper scripts"])
+        seen_models: list[str] = []
+
+        # 1. Even on low confidence from free jev, paid jev-1.13 must NOT be called (escalates directly)
+        def low_conf_free_only(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            if "decisions" in endpoint:
+                m = f"{payload['model']['providerID']}/{payload['model']['id']}"
+                seen_models.append(m)
+                return {"data": {"answers": [{"choice": "allow", "confidence": 0.55}], "tokens": {"input": 200}}}
+            return {"data": {"text": '{"decision":"allow","reason":"Safe read."}'}}
+
+        res_low = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_paid_0",
+                "workspacePaths": ["/workspace/project"],
+                "transcriptPath": str(tp),
+                "toolCall": {"name": "read_file", "args": {"Path": "/opt/other_repo/a.py"}},
+            },
+            api_caller=low_conf_free_only,
+        )
+        self.assertEqual(res_low["decision"], "allow")
+        self.assertEqual(seen_models, ["opencode/jev-1.13-free"])
+
+        # 2. Using real call_opencode_api + mocked subprocess.run: HTTP 429 on jev-1.13-free triggers
+        #    backoff and immediate failover to paid opencode/jev-1.13, tracking costUsd in MCP status
+        seen_subproc_models: list[str] = []
+
+        def fake_subprocess_run(cmd, capture_output, text, timeout, env, check):
+            payload = json.loads(cmd[cmd.index("-d") + 1])
+            m = f"{payload['model']['providerID']}/{payload['model']['id']}"
+            seen_subproc_models.append(m)
+            if m == "opencode/jev-1.13-free":
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="HTTP 429 Too Many Requests")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps({"data": {"answers": [{"choice": "allow", "confidence": 0.93}], "tokens": {"input": 1000, "output": 4}}}),
+                stderr="",
+            )
+
+        with mock.patch.object(llm_classifier, "find_opencode_binary", return_value="/opt/homebrew/bin/opencode"), \
+             mock.patch.object(llm_classifier.subprocess, "run", side_effect=fake_subprocess_run):
+            res_failover = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_paid_1",
+                    "workspacePaths": ["/workspace/project"],
+                    "transcriptPath": str(tp),
+                    "toolCall": {"name": "read_file", "args": {"Path": "/opt/other_repo/b.py"}},
+                }
+            )
+            self.assertEqual(res_failover["decision"], "allow")
+            self.assertEqual(seen_subproc_models, ["opencode/jev-1.13-free", "opencode/jev-1.13"])
+
+            # Next request skips jev-1.13-free while backoff is active and uses paid jev-1.13 directly
+            seen_subproc_models.clear()
+            res_cached_backoff = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_paid_2",
+                    "workspacePaths": ["/workspace/project"],
+                    "transcriptPath": str(tp),
+                    "toolCall": {"name": "read_file", "args": {"Path": "/opt/other_repo/c.py"}},
+                }
+            )
+            self.assertEqual(res_cached_backoff["decision"], "allow")
+            self.assertEqual(seen_subproc_models, ["opencode/jev-1.13"])
+
+        # Verify MCP server reports positive total_cost_usd for the paid jev calls
+        mcp_resp = mcp_reviewer_server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "permission_reviewer_status", "arguments": {"conversation_id": "c_paid_2"}},
+            }
+        )
+        status_obj = json.loads(mcp_resp["result"]["content"][0]["text"])
+        self.assertGreater(status_obj["llm_usage_summary"]["total_cost_usd"], 0.0)
+
+    def test_escalation_timeout_backoff_switches_to_longcat(self) -> None:
+        tp = self._write_transcript(["Check /opt/other_repo/script.sh"])
+        seen_subproc_models: list[str] = []
+
+        def fake_subprocess_run(cmd, capture_output, text, timeout, env, check):
+            payload = json.loads(cmd[cmd.index("-d") + 1])
+            m = f"{payload['model']['providerID']}/{payload['model']['id']}"
+            seen_subproc_models.append(m)
+            if m == "opencode/jev-1.13-free":
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=json.dumps({"data": {"answers": [{"choice": "allow", "confidence": 0.55}]}}),
+                    stderr="",
+                )
+            if m == "opencode-go/beam-free":
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps({"data": {"text": '{"decision":"allow","reason":"Safe read via longcat."}'}}),
+                stderr="",
+            )
+
+        with mock.patch.object(llm_classifier, "find_opencode_binary", return_value="/opt/homebrew/bin/opencode"), \
+             mock.patch.object(llm_classifier.subprocess, "run", side_effect=fake_subprocess_run):
+            res1 = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_esc_1",
+                    "workspacePaths": ["/workspace/project"],
+                    "transcriptPath": str(tp),
+                    "toolCall": {"name": "read_file", "args": {"Path": "/opt/other_repo/a.sh"}},
+                }
+            )
+            self.assertEqual(res1["decision"], "allow")
+            self.assertIn("opencode-go/longcat-2.5-free", res1["reason"])
+            self.assertEqual(seen_subproc_models, ["opencode/jev-1.13-free", "opencode-go/beam-free", "opencode-go/longcat-2.5-free"])
+
+            # Subsequent escalation skips backed-off beam-free immediately
+            seen_subproc_models.clear()
+            res2 = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_esc_2",
+                    "workspacePaths": ["/workspace/project"],
+                    "transcriptPath": str(tp),
+                    "toolCall": {"name": "read_file", "args": {"Path": "/opt/other_repo/b.sh"}},
+                }
+            )
+            self.assertEqual(res2["decision"], "allow")
+            self.assertEqual(seen_subproc_models, ["opencode/jev-1.13-free", "opencode-go/longcat-2.5-free"])
 
 
 if __name__ == "__main__":

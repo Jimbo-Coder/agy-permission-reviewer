@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
@@ -30,13 +31,15 @@ ROTATE_BYTES = 512 * 1024  # 512 KB cap per rotated log file
 MAX_STATE_FILES = 30  # Keep only the 30 most recent conversation audit/cache/ledger files
 MAX_CACHE_ENTRIES = 250  # Bound per-conversation verdict cache size
 
-DEFAULT_DECISION_MODELS = ["opencode/jev-1.13-free"]
+DEFAULT_DECISION_MODELS = ["opencode/jev-1.13-free", "opencode/jev-1.13"]
 DEFAULT_ESCALATION_MODELS = [
     "opencode-go/beam-free",
     "opencode-go/longcat-2.5-free",
 ]
 DEFAULT_MIN_CONFIDENCE = 0.80
 DEFAULT_MAX_SEND_BACKS = 3
+DEFAULT_DECISION_TIMEOUT_SEC = 4.5
+DEFAULT_ESCALATION_TIMEOUT_SEC = 6.5
 
 REVIEW_BRIEF = (
     "You review permission requests from an autonomous AI coding agent on the user's own computer. "
@@ -104,7 +107,7 @@ def extract_compact_transcript(
     transcript_path: Path | None,
     max_items: int = 12,
     max_chars: int = 2800,
-    include_thinking: bool = False,
+    include_thinking: bool = True,
 ) -> str:
     """Build compact recent conversation transcript (tight default for jev-1.13-free; expandable for escalation)."""
     if not transcript_path or not transcript_path.is_file():
@@ -152,7 +155,8 @@ def extract_compact_transcript(
             if include_thinking:
                 thought = str(obj.get("thinking", "")).strip()
                 if thought:
-                    items.append(f"[Agent reasoning]: {thought[:350]}")
+                    thought_limit = 200 if max_chars <= 3000 else 350
+                    items.append(f"[Agent reasoning]: {thought[:thought_limit]}")
             text = str(obj.get("content", "")).strip()
             if text:
                 items.append(f"[Agent]: {text[:agent_limit]}")
@@ -260,6 +264,17 @@ def call_opencode_api(
 
 
 JEV_BACKOFF_SECONDS = 120.0
+PAID_BACKOFF_SECONDS = 30.0
+ESCALATION_BACKOFF_SECONDS = 60.0
+_BACKOFF_HTTP_RE = re.compile(r"\b(?:429|500|502|503|504)\b|rate[- ]?limit|too many requests", re.IGNORECASE)
+
+
+def _should_backoff_error(exc: Exception, err_s: str, is_paid: bool = False) -> bool:
+    if _BACKOFF_HTTP_RE.search(err_s):
+        return True
+    if not is_paid and (isinstance(exc, subprocess.TimeoutExpired) or "timed out" in err_s.lower()):
+        return True
+    return False
 
 
 def _is_jev_backed_off(model_label: str) -> bool:
@@ -274,11 +289,11 @@ def _is_jev_backed_off(model_label: str) -> bool:
         return False
 
 
-def _record_jev_backoff(model_label: str) -> None:
+def _record_jev_backoff(model_label: str, ttl_sec: float = JEV_BACKOFF_SECONDS) -> None:
     try:
         bf = _state_dir() / "jev_backoff.json"
         data = json.loads(bf.read_text(encoding="utf-8")) if bf.is_file() else {}
-        data[model_label] = time.time() + JEV_BACKOFF_SECONDS
+        data[model_label] = time.time() + ttl_sec
         bf.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
@@ -290,16 +305,16 @@ def run_jev_decision_tier(
     user_messages: list[str],
     compact_transcript: str,
     requested_action: dict[str, Any],
-    timeout_sec: float = 20.0,
+    timeout_sec: float = DEFAULT_DECISION_TIMEOUT_SEC,
     api_caller: Any = call_opencode_api,
 ) -> dict[str, Any]:
-    """Tier 1/2 first pass: ask `opencode/jev-1.13-free` via `generate.decisions`."""
+    """Tier 1/2 first pass: ask `opencode/jev-1.13-free` (failing over to `opencode/jev-1.13` only on error/429/5xx/timeout)."""
     last_error = "no decision model configured"
     for model_spec in models:
         model_obj = parse_model_id(model_spec)
         label = f"{model_obj['providerID']}/{model_obj['id']}"
         if api_caller is call_opencode_api and _is_jev_backed_off(label):
-            last_error = f"{label}: skipped (upstream 5xx backoff active)"
+            last_error = f"{label}: skipped (backoff active)"
             continue
         req_payload = {
             "model": model_obj,
@@ -352,6 +367,16 @@ def run_jev_decision_tier(
             choice = str(ans.get("choice", "")) if ans else ""
             confidence = float(ans.get("confidence", 0.0)) if ans else 0.0
             passes = choice in ("allow", "deny") and confidence >= min_confidence
+            raw_cost = unwrapped.get("cost") if isinstance(unwrapped, dict) else None
+            if isinstance(raw_cost, (int, float)):
+                cost_usd = float(raw_cost)
+                cost_estimated = False
+            elif label == "opencode/jev-1.13" and isinstance(tokens.get("input"), (int, float)):
+                cost_usd = round(int(tokens["input"]) * 0.042 / 1_000_000.0, 8)
+                cost_estimated = True
+            else:
+                cost_usd = 0.0
+                cost_estimated = False
             record_usage(
                 {
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -361,8 +386,8 @@ def run_jev_decision_tier(
                     "outcome": "error" if (not ans or ans.get("type") == "error") else (choice if passes else "ask"),
                     **({"tokensIn": int(tokens["input"])} if isinstance(tokens.get("input"), (int, float)) else {}),
                     **({"tokensOut": int(tokens["output"])} if isinstance(tokens.get("output"), (int, float)) else {}),
-                    "costUsd": float(unwrapped.get("cost", 0.0)) if isinstance(unwrapped, dict) and isinstance(unwrapped.get("cost"), (int, float)) else 0.0,
-                    "estimated": False,
+                    "costUsd": cost_usd,
+                    "estimated": cost_estimated,
                     "elapsedMs": round((time.perf_counter() - call_t0) * 1000),
                 }
             )
@@ -393,8 +418,22 @@ def run_jev_decision_tier(
             }
         except Exception as exc:
             err_s = str(exc)
-            if api_caller is call_opencode_api and any(code in err_s for code in ("HTTP 502", "HTTP 503", "HTTP 504")):
-                _record_jev_backoff(label)
+            record_usage(
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "tier": "first",
+                    "model": label,
+                    "route": "decision",
+                    "outcome": "error",
+                    "costUsd": 0.0,
+                    "estimated": False,
+                    "elapsedMs": round((time.perf_counter() - call_t0) * 1000),
+                    "error": err_s[:160],
+                }
+            )
+            is_paid = label == "opencode/jev-1.13"
+            if api_caller is call_opencode_api and _should_backoff_error(exc, err_s, is_paid=is_paid):
+                _record_jev_backoff(label, ttl_sec=PAID_BACKOFF_SECONDS if is_paid else JEV_BACKOFF_SECONDS)
             last_error = f"{label}: {err_s}"
     return {
         "effect": "ask",
@@ -435,7 +474,7 @@ def run_escalation_tier(
     requested_action: dict[str, Any],
     first_verdict: dict[str, Any],
     compact_transcript: str,
-    timeout_sec: float = 35.0,
+    timeout_sec: float = DEFAULT_ESCALATION_TIMEOUT_SEC,
     api_caller: Any = call_opencode_api,
 ) -> dict[str, Any] | None:
     """Second opinion across free chat models (`beam-free`, `longcat-2.5-free`, `deepseek-v4.1-flash`)."""
@@ -461,6 +500,8 @@ def run_escalation_tier(
             continue
         model_obj = parse_model_id(entry)
         label = f"{model_obj['providerID']}/{model_obj['id']}"
+        if api_caller is call_opencode_api and _is_jev_backed_off(label):
+            continue
         req_payload = {"model": model_obj, "prompt": prompt}
         call_t0 = time.perf_counter()
         try:
@@ -505,7 +546,25 @@ def run_escalation_tier(
                 ),
                 "reason": f"{verdict['reason']} (second opinion: {label})",
             }
-        except Exception:
+        except Exception as exc:
+            err_s = str(exc)
+            record_usage(
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "tier": "escalation",
+                    "model": label,
+                    "route": "transcript",
+                    "outcome": "error",
+                    "tokensIn": (len(prompt) + 3) // 4,
+                    "tokensOut": 0,
+                    "costUsd": 0.0,
+                    "estimated": True,
+                    "elapsedMs": round((time.perf_counter() - call_t0) * 1000),
+                    "error": err_s[:160],
+                }
+            )
+            if api_caller is call_opencode_api and _should_backoff_error(exc, err_s):
+                _record_jev_backoff(label, ttl_sec=ESCALATION_BACKOFF_SECONDS)
             continue
     return None
 

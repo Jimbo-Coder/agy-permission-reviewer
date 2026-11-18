@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -343,6 +344,214 @@ class TestPermissionReviewer(unittest.TestCase):
                 cwd=ws,
             )
             self.assertTrue(act["details"]["isDestructiveOrDelete"])
+
+    def test_internal_non_permission_tools_fast_allow_and_hooks_matcher(self) -> None:
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+
+        def fail_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            raise AssertionError(f"LLM tier should not be invoked for internal tools ({endpoint})")
+
+        for tool_name, args in (
+            ("exit_plan_mode", {"plan": "# Big plan\nStep 1..."}),
+            ("enter_plan_mode", {"reason": "Need design choice"}),
+            ("manage_task", {"Action": "list"}),
+            ("schedule", {"DurationSeconds": 10, "Prompt": "ping"}),
+            ("search_web", {"query": "python unittest"}),
+        ):
+            res = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_internal",
+                    "workspacePaths": ["/workspace/project"],
+                    "toolCall": {"name": tool_name, "args": args},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(res["decision"], "allow", msg=f"{tool_name} failed to fast-allow")
+            self.assertIn("Tier 0", res["reason"])
+
+        hooks_cfg = json.loads(
+            (Path(__file__).resolve().parents[1] / "hooks.json").read_text(encoding="utf-8")
+        )
+        matcher = hooks_cfg["context-permission-reviewer"]["PreToolUse"][0]["matcher"]
+        matcher_re = re.compile(matcher)
+        for reviewed in ("run_command", "read_file", "edit_file", "write_file", "call_mcp_tool", "mcp_foo", "browser_click"):
+            self.assertIsNotNone(matcher_re.fullmatch(reviewed), msg=f"matcher missed {reviewed}")
+        for internal in ("exit_plan_mode", "enter_plan_mode", "manage_task", "schedule", "search_web", "swarm", "invoke_subagent"):
+            self.assertIsNone(matcher_re.fullmatch(internal), msg=f"matcher unexpectedly matched {internal}")
+
+    def test_std_bin_paths_env_path_redirects_multi_m_commit_and_gh_api(self) -> None:
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        ws = "/workspace/project"
+
+        def fail_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            raise AssertionError(f"Tier 2 should not run for routine Tier 0 command ({endpoint})")
+
+        routine_cases = [
+            ("/usr/bin/git add src/a.py", False),
+            ('/usr/bin/git commit -m "title" -m "body mentioning git push and /etc/passwd"', False),
+            ('export PATH="/opt/homebrew/bin:/usr/bin:/bin"; /opt/homebrew/bin/uv run pytest 2>&1', True),
+            ("/opt/homebrew/bin/gh api repos/org/repo/pulls/1 --jq '.title'", True),
+            ("/opt/homebrew/bin/gh pr checks 58 -R org/repo", True),
+        ]
+        for cmd, bypass in routine_cases:
+            res = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_std_bin",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": cmd, "BypassSandbox": bypass}},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(res["decision"], "allow", msg=f"Expected Tier 0 allow for: {cmd!r}, got {res}")
+
+        # Mutating /opt/homebrew/bin/gh api -X PATCH must STILL require force_ask
+        res_patch = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_std_bin",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "/opt/homebrew/bin/gh api -X PATCH repos/org/repo/pulls/1 --input /tmp/p.json",
+                        "BypassSandbox": True,
+                    },
+                },
+            },
+            api_caller=fail_api,
+        )
+        self.assertEqual(res_patch["decision"], "ask")
+        self.assertEqual(review_hook.to_antigravity_hook_output(res_patch)["decision"], "force_ask")
+
+        # Redirect or rm -f targeting /usr/local/bin must NOT fast-allow at Tier 0
+        tier2_calls: list[str] = []
+
+        def fake_deny(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            tier2_calls.append(endpoint)
+            return {"data": {"answers": [{"choice": "deny", "confidence": 0.95}]}}
+
+        for unsafe_cmd in ("echo hi > /usr/local/bin/evil", "rm -f /usr/local/bin/evil"):
+            tier2_calls.clear()
+            res_unsafe = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_std_bin",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": unsafe_cmd, "BypassSandbox": True}},
+                },
+                api_caller=fake_deny,
+            )
+            self.assertEqual(res_unsafe["decision"], "deny")
+            self.assertEqual(len(tier2_calls), 1, msg=f"{unsafe_cmd} bypassed Tier 0!")
+
+    def test_network_command_in_sandbox_denies_without_calling_llm_or_prompting(self) -> None:
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        ws = "/workspace/project"
+
+        def fail_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            raise AssertionError(f"Tier 2 should not run for sandbox network mismatch ({endpoint})")
+
+        for net_cmd in (
+            "git push origin main",
+            "/opt/homebrew/bin/gh pr list --repo org/repo",
+            'ssh dev-workstation "df -h"',
+        ):
+            res = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_net_sb",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": net_cmd, "BypassSandbox": False}},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(res["decision"], "deny", msg=f"Expected deny for sandboxed {net_cmd}")
+            self.assertIn("BypassSandbox=true", res["reason"])
+
+        # Same git push with BypassSandbox=True -> single native force_ask
+        res_ok = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_net_sb",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main", "BypassSandbox": True}},
+            },
+            api_caller=fail_api,
+        )
+        self.assertEqual(res_ok["decision"], "ask")
+        self.assertEqual(review_hook.to_antigravity_hook_output(res_ok)["decision"], "force_ask")
+
+        # Commit message mentioning git pull / gh pr must still fast-allow inside sandbox
+        res_commit = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_net_sb",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": 'git commit -m "Document git pull and gh pr flow"', "BypassSandbox": False},
+                },
+            },
+            api_caller=fail_api,
+        )
+        self.assertEqual(res_commit["decision"], "allow")
+
+    def test_sandboxed_inline_python_reuses_session_dir_cache_after_first_approval(self) -> None:
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        ws = "/workspace/project"
+        calls: list[str] = []
+
+        def fake_allow(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            calls.append(endpoint)
+            return {"data": {"answers": [{"choice": "allow", "confidence": 0.96}]}}
+
+        res1 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_py_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "python3 -c 'print(open(\"/opt/ext_proj/a.py\").read())'", "BypassSandbox": False},
+                },
+            },
+            api_caller=fake_allow,
+        )
+        self.assertEqual(res1["decision"], "allow")
+        self.assertEqual(len(calls), 1)
+
+        # Different inline python command on the same external dir (still sandboxed) hits session_dir_cache!
+        res2 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_py_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "python3 -c 'print(len(open(\"/opt/ext_proj/b.py\").read()))'", "BypassSandbox": False},
+                },
+            },
+            api_caller=fake_allow,
+        )
+        self.assertEqual(res2["decision"], "allow")
+        self.assertEqual(len(calls), 1)
+
+        # Unsandboxed inline python must NOT reuse session_dir_cache and must still go to Tier 2
+        res3 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_py_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "python3 -c 'print(open(\"/opt/ext_proj/c.py\").read())'", "BypassSandbox": True},
+                },
+            },
+            api_caller=fake_allow,
+        )
+        self.assertEqual(res3["decision"], "allow")
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

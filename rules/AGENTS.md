@@ -1,11 +1,11 @@
 # Context-Aware Permission Reviewer & Agent Hygiene
 
-Shell commands and out-of-workspace file actions that need approval are judged by an automatic reviewer (`opencode/jev-1.13-free` with escalation to free chat models) that sees the command text, `toolSummary`, and compact recent conversation, but not your internal reasoning.
+Shell commands and out-of-workspace file actions that need approval are judged by an automatic reviewer (`opencode/jev-1.13-free` with paid `opencode/jev-1.13` failover and escalation to free chat models) that sees the command text, `toolSummary`, and compact recent conversation, but not your internal reasoning.
 
 1. **No Tautological Tests, Comments, or UI**:
    - **Comments & `# purpose:` hints**: Never write comments that merely restate what the code or command already says (`i += 1  # increment i` or `pytest tests/  # purpose: run pytest on tests`). Only add a comment or `# purpose:` hint when it conveys *why* (intent, invariant, or non-obvious context) that is not already visible from the command and `toolSummary`.
    - **Tests**: Never write tautological tests that only assert mock return values, mirror implementation constants line-for-line, or cannot fail when real behavior breaks. Every test must exercise a real boundary, invariant, or regression mode.
-   - **UI / Output**: Avoid noisy status banners, redundant wrapper text, or UI chrome that repeats what the underlying data or tool output already shows. Keep user-facing chat summaries short, scannable, and in plain English: never dump walls of code identifiers, internal variable or test names, commit hashes, precision thresholds, or raw multi-digit float lists into chat (keep detailed receipts in the audit or log file unless the user asks for specific numbers). Fix persistent workflow or rule issues directly rather than telling the user to run `/learn` or do agent housekeeping.
+   - **UI / Output**: Avoid noisy status banners, redundant wrapper text, or UI chrome that repeats what the underlying data or tool output already shows.
 
 2. **When Sent Back by Auto Permissions**:
    If a command is refused with an `Auto Permissions did not approve this command` note, do **not** blindly retry the identical command:
@@ -20,6 +20,7 @@ Shell commands and out-of-workspace file actions that need approval are judged b
 
 4. **Public/External Mutations vs. Local Safe Workflows**:
    - **Always Confirm Public/External Changes**: Never modify public or external state (`git push`, GitHub issues/PRs/comments/reviews/releases/gists, package publishing, or any external repository) without explicit user confirmation first.
+   - **Direct `BypassSandbox: true` for Network Commands**: Commands that inherently require outbound network (`git push`, `git pull`, `git fetch`, `git clone https://...`, `gh`, `ssh`, `scp`, remote `curl`/`wget`, registry `publish`) always fail in the no-network sandbox (`BypassSandbox: false`). Set `BypassSandbox: true` on the first call (after explicit user confirmation for any public/remote mutation) instead of running a guaranteed-to-fail sandboxed attempt first.
    - **Local Autonomy & Cleanup**: Local code edits, documentation updates, local `git add` / `git commit` / `git branch` / `git stash`, and temporary local backups or scratch files are encouraged to keep development moving smoothly. Always clean up temporary backups, probe files, and scratch artifacts once the work is verified and committed.
    - **Harmless-Only Live Tests**: When testing permission or hook behavior live, only use harmless no-ops (such as `true`, `echo`, or reading a dummy test file) so that even if a command is unexpectedly allowed through, it has zero side effects.
 
