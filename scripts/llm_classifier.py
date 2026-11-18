@@ -31,15 +31,16 @@ ROTATE_BYTES = 512 * 1024  # 512 KB cap per rotated log file
 MAX_STATE_FILES = 30  # Keep only the 30 most recent conversation audit/cache/ledger files
 MAX_CACHE_ENTRIES = 250  # Bound per-conversation verdict cache size
 
-DEFAULT_DECISION_MODELS = ["opencode/jev-1.13-free", "opencode/jev-1.13"]
+DEFAULT_DECISION_MODELS = ["opencode/jev-1.13-free"]
+DEFAULT_PAID_FALLBACK_MODELS = ["opencode/jev-1.13"]
 DEFAULT_ESCALATION_MODELS = [
     "opencode-go/beam-free",
     "opencode-go/longcat-2.5-free",
 ]
 DEFAULT_MIN_CONFIDENCE = 0.80
 DEFAULT_MAX_SEND_BACKS = 3
-DEFAULT_DECISION_TIMEOUT_SEC = 4.5
-DEFAULT_ESCALATION_TIMEOUT_SEC = 6.5
+DEFAULT_DECISION_TIMEOUT_SEC = 3.5
+DEFAULT_ESCALATION_TIMEOUT_SEC = 5.0
 
 REVIEW_BRIEF = (
     "You review permission requests from an autonomous AI coding agent on the user's own computer. "
@@ -107,7 +108,7 @@ def extract_compact_transcript(
     transcript_path: Path | None,
     max_items: int = 12,
     max_chars: int = 2800,
-    include_thinking: bool = True,
+    include_thinking: bool = False,
 ) -> str:
     """Build compact recent conversation transcript (tight default for jev-1.13-free; expandable for escalation)."""
     if not transcript_path or not transcript_path.is_file():
@@ -308,14 +309,32 @@ def run_jev_decision_tier(
     timeout_sec: float = DEFAULT_DECISION_TIMEOUT_SEC,
     api_caller: Any = call_opencode_api,
 ) -> dict[str, Any]:
-    """Tier 1/2 first pass: ask `opencode/jev-1.13-free` (failing over to `opencode/jev-1.13` only on error/429/5xx/timeout)."""
+    """Tier 2 decision pass via Jev (`opencode/jev-1.13-free` or paid `opencode/jev-1.13` fallback)."""
     last_error = "no decision model configured"
+    clean_action = (
+        {k: v for k, v in requested_action.items() if k != "recent_user_messages"}
+        if isinstance(requested_action, dict)
+        else requested_action
+    )
     for model_spec in models:
         model_obj = parse_model_id(model_spec)
         label = f"{model_obj['providerID']}/{model_obj['id']}"
         if api_caller is call_opencode_api and _is_jev_backed_off(label):
             last_error = f"{label}: skipped (backoff active)"
             continue
+        is_paid = label == "opencode/jev-1.13"
+        msg_limit = 2 if is_paid else 4
+        char_limit = 300 if is_paid else 500
+        trimmed_msgs = [str(m)[:char_limit] for m in user_messages[-msg_limit:]]
+        tx_str = compact_transcript
+        if is_paid and tx_str and len(tx_str) > 1000:
+            if tx_str.startswith("[User]:"):
+                first_nl = tx_str.find("\n")
+                head = (tx_str[: first_nl + 1] + "[... truncated ...]\n") if first_nl != -1 else ""
+                rem = max(350, 1000 - len(head))
+                tx_str = head + tx_str[-rem:]
+            else:
+                tx_str = tx_str[-1000:]
         req_payload = {
             "model": model_obj,
             "input": [
@@ -323,13 +342,13 @@ def run_jev_decision_tier(
                 {
                     "type": "json",
                     "value": {
-                        "recent_user_messages": user_messages[-6:],
+                        "recent_user_messages": trimmed_msgs,
                         **(
-                            {"recent_conversation_oldest_first": compact_transcript}
-                            if compact_transcript
+                            {"recent_conversation_oldest_first": tx_str}
+                            if tx_str
                             else {}
                         ),
-                        "requested_action": requested_action,
+                        "requested_action": clean_action,
                     },
                 },
             ],

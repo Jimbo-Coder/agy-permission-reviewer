@@ -553,6 +553,54 @@ class TestPermissionReviewer(unittest.TestCase):
         self.assertEqual(res3["decision"], "allow")
         self.assertEqual(len(calls), 2)
 
+        # Python // integer division inside sandbox must NOT parse //2 as /2 external path
+        res_div = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_py_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "python3 -c 'print(10//2)'", "BypassSandbox": False},
+                },
+            },
+            api_caller=fake_allow,
+        )
+        self.assertEqual(res_div["decision"], "allow")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Tier 0", res_div["reason"])
+
+        # 4-level-deep file under approved /opt/ext_proj hits session_dir_cache, while sibling /opt/other_proj does not
+        res_deep = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_py_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "read_file",
+                    "args": {"Path": "/opt/ext_proj/sub1/sub2/sub3/deep.py"},
+                },
+            },
+            api_caller=fake_allow,
+        )
+        self.assertEqual(res_deep["decision"], "allow")
+        self.assertEqual(len(calls), 2)
+
+        res_sibling = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_py_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "read_file",
+                    "args": {"Path": "/opt/other_proj/secret.py"},
+                },
+            },
+            api_caller=fake_allow,
+        )
+        self.assertEqual(res_sibling["decision"], "allow")
+        self.assertEqual(len(calls), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

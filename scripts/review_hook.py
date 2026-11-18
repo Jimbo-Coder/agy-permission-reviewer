@@ -43,6 +43,7 @@ from llm_classifier import (
     DEFAULT_ESCALATION_TIMEOUT_SEC,
     DEFAULT_MAX_SEND_BACKS,
     DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_PAID_FALLBACK_MODELS,
     ROTATE_BYTES,
     apply_unresolved_send_back,
     compute_directory_grant_key,
@@ -366,6 +367,21 @@ def _has_non_discard_file_redirect(code_only: str) -> bool:
         if target_tok not in DISCARD_REDIRECT_TARGETS:
             return True
     return False
+
+
+def _dir_grant_candidates(path_str: str, include_self: bool = False, max_levels: int = 4) -> list[str]:
+    """Return ancestor directories (up to `max_levels`) eligible for `session_dir_cache` grants,
+    stopping before root, top-level OS dirs (`/opt`, `/Users`, ...), and `Path.home()`.
+    """
+    home_path = Path.home().resolve()
+    p = Path(path_str)
+    raw_cands = ([p] if include_self else []) + list(p.parents)[:max_levels]
+    out: list[str] = []
+    for cand in raw_cands:
+        if len(cand.parts) <= 2 or cand == Path.home() or cand == home_path:
+            break
+        out.append(str(cand))
+    return out
 
 
 def is_safe_scoped_path(path_str: str, norm_workspaces: list[str], artifact_dir: str) -> bool:
@@ -836,7 +852,7 @@ def evaluate_tool_call(
                     )
                     if raw_p:
                         norm_p = normalize_path(raw_p, cwd=cwd)
-                        for cd in (str(Path(norm_p).parent), str(Path(norm_p).parent.parent)):
+                        for cd in _dir_grant_candidates(norm_p, include_self=False, max_levels=4):
                             dir_verdict = get_cached_verdict(conversation_id, compute_directory_grant_key(cd))
                             if dir_verdict is not None and dir_verdict.get("effect") == "allow":
                                 cached = {
@@ -848,11 +864,11 @@ def evaluate_tool_call(
                                 }
                                 break
                 if cached is None and cmd_outside_dirs:
-                    # Check if every referenced external path (or its parent dir) has an approved dir_grant
+                    # Check if every referenced external path (or an ancestor up to 4 levels) has an approved dir_grant
                     all_dirs_approved = True
                     for op in cmd_outside_dirs:
-                        cand_dirs = [op, str(Path(op).parent), str(Path(op).parent.parent)]
-                        if not any(
+                        cand_dirs = _dir_grant_candidates(op, include_self=True, max_levels=4)
+                        if not cand_dirs or not any(
                             (get_cached_verdict(conversation_id, compute_directory_grant_key(cd)) or {}).get("effect") == "allow"
                             for cd in cand_dirs
                         ):
@@ -877,7 +893,12 @@ def evaluate_tool_call(
                         artifact_dir=artifact_dir,
                         ledger=ledger,
                     )
-                    compact_tx = extract_compact_transcript(transcript_path)
+                    compact_tx = extract_compact_transcript(
+                        transcript_path,
+                        max_items=10,
+                        max_chars=2000,
+                        include_thinking=False,
+                    )
                     decision_models = [
                         m.strip()
                         for m in os.environ.get(
@@ -889,6 +910,13 @@ def evaluate_tool_call(
                         m.strip()
                         for m in os.environ.get(
                             "AGY_ESCALATION_MODELS", ",".join(DEFAULT_ESCALATION_MODELS)
+                        ).split(",")
+                        if m.strip()
+                    ]
+                    paid_models = [
+                        m.strip()
+                        for m in os.environ.get(
+                            "AGY_PAID_DECISION_MODELS", ",".join(DEFAULT_PAID_FALLBACK_MODELS)
                         ).split(",")
                         if m.strip()
                     ]
@@ -914,9 +942,9 @@ def evaluate_tool_call(
                     if first.get("effect") == "ask" and escalation_models:
                         esc_tx = extract_compact_transcript(
                             transcript_path,
-                            max_items=24,
-                            max_chars=5500,
-                            include_thinking=True,
+                            max_items=18,
+                            max_chars=4200,
+                            include_thinking=False,
                         )
                         second = run_escalation_tier(
                             escalation_models=escalation_models,
@@ -926,7 +954,30 @@ def evaluate_tool_call(
                             timeout_sec=escalation_timeout,
                             **kwargs,
                         )
-                        verdict = second if second is not None else first
+                        if second is not None:
+                            verdict = second
+                        elif (
+                            first.get("reasonCode") == "review_failed"
+                            and "opencode binary not found" not in str(first.get("reason", ""))
+                            and paid_models
+                        ):
+                            paid_tx = extract_compact_transcript(
+                                transcript_path,
+                                max_items=6,
+                                max_chars=1000,
+                                include_thinking=False,
+                            )
+                            verdict = run_jev_decision_tier(
+                                models=paid_models,
+                                min_confidence=min_conf,
+                                user_messages=ledger.get("recent_user_messages", [])[-2:],
+                                compact_transcript=paid_tx,
+                                requested_action=requested_action,
+                                timeout_sec=decision_timeout,
+                                **kwargs,
+                            )
+                        else:
+                            verdict = first
                     else:
                         verdict = first
                     put_cached_verdict(conversation_id, req_key, verdict)
@@ -943,27 +994,19 @@ def evaluate_tool_call(
                         )
                         if raw_p:
                             norm_p = normalize_path(raw_p, cwd=cwd)
-                            put_cached_verdict(
-                                conversation_id,
-                                compute_directory_grant_key(str(Path(norm_p).parent)),
-                                verdict,
-                            )
-                            put_cached_verdict(
-                                conversation_id,
-                                compute_directory_grant_key(str(Path(norm_p).parent.parent)),
-                                verdict,
-                            )
+                            for cd in _dir_grant_candidates(norm_p, include_self=False, max_levels=2):
+                                put_cached_verdict(
+                                    conversation_id,
+                                    compute_directory_grant_key(cd),
+                                    verdict,
+                                )
                     for op in cmd_outside_dirs:
-                        put_cached_verdict(
-                            conversation_id,
-                            compute_directory_grant_key(op),
-                            verdict,
-                        )
-                        put_cached_verdict(
-                            conversation_id,
-                            compute_directory_grant_key(str(Path(op).parent)),
-                            verdict,
-                        )
+                        for cd in _dir_grant_candidates(op, include_self=True, max_levels=1):
+                            put_cached_verdict(
+                                conversation_id,
+                                compute_directory_grant_key(cd),
+                                verdict,
+                            )
 
                 unresolved_mode = os.environ.get("AGY_UNRESOLVED_MODE", "agent")
                 max_sb = int(os.environ.get("AGY_MAX_SEND_BACKS", str(DEFAULT_MAX_SEND_BACKS)))
