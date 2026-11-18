@@ -497,6 +497,87 @@ class TestPermissionReviewer(unittest.TestCase):
         )
         self.assertEqual(res_commit["decision"], "allow")
 
+    def test_mpi_tmux_process_and_remote_curl_sandbox_gate_and_mpi_fast_allow(self) -> None:
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        ws = "/workspace/project"
+
+        def fail_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            raise AssertionError(f"Tier 2 should not run here ({endpoint})")
+
+        # Deterministically sandbox-incompatible commands with BypassSandbox=False deny immediately at Tier 0
+        for sb_cmd in (
+            "mpirun -np 3 build/test_mpi",
+            "/bin/zsh -lc 'mpirun -np 2 build/test_mpi'",
+            "tmux list-sessions",
+            "ps -ef",
+            "launchctl list",
+            "curl -s https://api.github.com/repos/org/repo",
+        ):
+            res = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_sb_incompat",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": sb_cmd, "BypassSandbox": False}},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(res["decision"], "deny", msg=f"Expected Tier 0 deny for sandboxed {sb_cmd!r}")
+            self.assertIn("BypassSandbox=true", res["reason"])
+
+        # Loopback HTTP and grep containing |ps/|tmux inside quotes still fast-allow at Tier 0 in sandbox
+        for ok_sb_cmd in (
+            "curl -s http://127.0.0.1:8765/api/status",
+            'grep -E "foo|ps" src/main.py',
+        ):
+            res_ok_sb = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_sb_incompat",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": ok_sb_cmd, "BypassSandbox": False}},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(res_ok_sb["decision"], "allow", msg=f"Expected Tier 0 allow for {ok_sb_cmd!r}")
+
+        # In-workspace MPI binary with BypassSandbox=True fast-allows at Tier 0
+        res_mpi = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_sb_incompat",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "mpirun -np 3 build/test_mpi", "BypassSandbox": True}},
+            },
+            api_caller=fail_api,
+        )
+        self.assertEqual(res_mpi["decision"], "allow")
+        self.assertIn("Tier 0", res_mpi["reason"])
+
+        # Inline python3 -c inside mpirun and mutating tmux send-keys (BypassSandbox=True) must still go to Tier 2
+        tier2_calls: list[str] = []
+
+        def fake_allow(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            tier2_calls.append(endpoint)
+            return {"data": {"answers": [{"choice": "allow", "confidence": 0.95}]}}
+
+        for tier2_cmd in (
+            'mpirun -np 1 python3 -c "import os"',
+            'tmux send-keys -t s "cmd" Enter',
+        ):
+            tier2_calls.clear()
+            res_t2 = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_sb_incompat",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": tier2_cmd, "BypassSandbox": True}},
+                },
+                api_caller=fake_allow,
+            )
+            self.assertEqual(res_t2["decision"], "allow")
+            self.assertEqual(len(tier2_calls), 1, msg=f"{tier2_cmd!r} bypassed Tier 2!")
+
     def test_sandboxed_inline_python_reuses_session_dir_cache_after_first_approval(self) -> None:
         review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
         ws = "/workspace/project"

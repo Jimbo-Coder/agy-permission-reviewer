@@ -100,14 +100,30 @@ _SEGMENT_CMD_PREFIX = (
     r"(?:/[\w./-]+/)?"
 )
 
-# Commands that inherently require outbound network and always fail inside the no-network sandbox
-NETWORK_REQUIRED_COMMAND_RE = re.compile(
-    _SEGMENT_CMD_PREFIX
+_SANDBOX_CMD_PREFIX = (
+    r"(?:^|(?<!\\)(?:&&|\|\||;)\s*|(?<!\\)\|\s+|(?:(?:/[\w./-]+/)?(?:ba|z)?sh\s+-[a-zA-Z]*c\s+[\"']\s*))"
+    r"(?:export\s+[^;&|]+;\s*|(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)\s+))*"
+    r"(?:/[\w./-]+/)?"
+)
+
+# Commands that require outbound network, MPI shared-memory IPC, tmux sockets, or host process
+# inspection and deterministically fail inside the macOS seatbelt sandbox (BypassSandbox=false).
+SANDBOX_INCOMPATIBLE_COMMAND_RE = re.compile(
+    _SANDBOX_CMD_PREFIX
     + r"(?:git\s+(?:-C\s+\S+\s+)?(?:push|pull|fetch|ls-remote|clone\s+(?:https?://|ssh://|git@))\b"
     + r"|gh\s+(?:pr|issue|release|gist|repo|run|api|workflow|search)\b"
-    + r"|ssh\s+(?!-[vV](?:\s|$))|scp\s+|sftp\s+"
-    + r"|(?:npm|pnpm|yarn|cargo|uv)\s+(?:npm\s+)?publish\b|twine\s+upload\b)"
+    + r"|ssh\s+(?!-[vV](?:\s|$))|scp\s+|sftp\s+|rsync\b[^;&|]*\s+\S+@?\S+:\S+"
+    + r"|(?:curl|wget)\b[^;&|]*https?://(?!(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::|/|\s|[\"']|$))"
+    + r"|(?:ping|dig|nslookup|traceroute)\s+"
+    + r"|(?:npm|pnpm|yarn|cargo|uv)\s+(?:npm\s+)?publish\b|twine\s+upload\b"
+    + r"|brew\s+(?:update|upgrade|install|reinstall|fetch|tap)\b"
+    + r"|(?:pip3?|uv\s+pip)\s+install\b(?![^;&|]*--(?:offline|no-index))"
+    + r"|opencode\s+(?:api|models|service)\b"
+    + r"|(?:mpirun|mpiexec|orterun|prterun|srun)\b(?![^;&|]*(?:--version|-V\b|--help|-h\b))"
+    + r"|tmux\b(?![^;&|]*-V\b)"
+    + r"|(?:ps|pgrep|pkill|killall|top|lsof|launchctl|osascript)\b)"
 )
+NETWORK_REQUIRED_COMMAND_RE = SANDBOX_INCOMPATIBLE_COMMAND_RE
 
 # Read-only inspection, local test/build runners, and local git commands (never push/reset/clean).
 # Combined with `not outside_paths`, these fast-allow in <1 ms when all referenced paths are inside
@@ -116,6 +132,7 @@ ROUTINE_SEGMENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^git\s+(?:-C\s+\S+\s+)?(?:status|diff|log|show|rev-parse|remote\s+-v$|branch(?:\s+(?:--show-current|--list|-a|-v|-vv|-r))*$|add\b|commit\b|stash\b|check-ignore\b)(?:\s|$)"),
     re.compile(r"^uv\s+run\s+(?:python3?|pytest|ruff|mypy)\b"),
     re.compile(r"^python3?\s+(?:-m\s+(?:unittest|pytest|py_compile|ruff|mypy)\b|\S+\.py\b)"),
+    re.compile(r"^(?:mpirun|mpiexec|orterun|prterun)\b(?![^;&|]*(?:\b(?:ba|z|da|k)?sh\b|\bpython3?\s+-c\b|\bperl\s+-e\b|\bruby\s+-e\b|\bnode\s+-e\b))"),
     re.compile(r"^(?:cmake|ctest|ninja|make)\b"),
     re.compile(r"^(?:clang\+\+|clang|g\+\+|gcc|nvcc|rustc|javac|javap)\b"),
     re.compile(r"^(?:npm|pnpm|yarn|bun)\s+(?:test|run\s+(?:test|lint|build|typecheck|check))(?:\s|$)"),
@@ -123,7 +140,7 @@ ROUTINE_SEGMENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^go\s+test(?:\s|$)"),
     re.compile(r"^(?:pytest|ruff\s+check|tsc)(?:\s|$)"),
     re.compile(r"^gh\s+(?:pr\s+(?:list|view|checks|diff|status)|issue\s+(?:list|view|status)|run\s+(?:list|view)|repo\s+view)(?:\s|$)"),
-    re.compile(r"^(?:ls|tree|wc|du|df|stat|file|which|pwd|whoami|uname|uptime|nproc|sw_vers|true|false|echo|printf)(?:\s|$)"),
+    re.compile(r"^(?:ls|tree|wc|du|df|stat|file|which|pwd|whoami|uname|uptime|nproc|sw_vers|true|false|echo|printf|ps|pgrep)(?:\s|$)"),
     re.compile(r"^(?:hostname|date)(?:\s+(?:-[sf]|\+\S+))?$"),
 ]
 
@@ -550,14 +567,14 @@ def check_tier0_static(
                     "reason": f"[Tier 0 Policy] Blocked catastrophic command pattern: {label}.",
                     "tier": "tier0_static",
                 }
-        if not bypass_sandbox and NETWORK_REQUIRED_COMMAND_RE.search(sanitized_cmd):
+        if not bypass_sandbox and SANDBOX_INCOMPATIBLE_COMMAND_RE.search(sanitized_cmd):
             return {
                 "decision": "deny",
                 "reason": (
-                    "[Tier 0 Policy] Command requires outbound network access and cannot succeed inside the "
-                    "no-network sandbox (BypassSandbox=false). Re-issue once with BypassSandbox=true "
-                    "(only after explicit user confirmation for public/remote mutations like git push or gh writes) "
-                    "so it is reviewed/approved only once."
+                    "[Tier 0 Policy] Command requires network, MPI shared-memory IPC, tmux socket, or host process "
+                    "permissions that deterministically fail inside the macOS sandbox (BypassSandbox=false). "
+                    "Re-issue once with BypassSandbox=true (only after explicit user confirmation for public/remote "
+                    "mutations like git push or gh writes)."
                 ),
                 "tier": "tier0_sandbox_network_mismatch",
             }
