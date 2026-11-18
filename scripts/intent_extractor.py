@@ -152,6 +152,11 @@ def _ledger_cache_file(transcript_path: Path) -> Path:
 from datetime import datetime
 
 METADATA_TIME_RE = re.compile(r"The current local time is:\s*([0-9T:\-+Z.]+)")
+LEDGER_CACHE_VERSION = 2
+SHORT_AFFIRMATION_RE = re.compile(
+    r"^(?:yes|yep|yeah|yup|sure|ok|okay|proceed|continue|keep going|go on|go ahead|do it|sounds good|lgtm|approved|i'?ve allowed|already allowed)\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_iso_seconds(ts_str: str) -> float | None:
@@ -173,31 +178,39 @@ def _extract_step_timestamp(obj: dict[str, Any]) -> float | None:
     return None
 
 
+def _unpack_ledger_entry(
+    entry: tuple[Any, ...],
+) -> tuple[int, str, float | None, str]:
+    return (
+        int(entry[0]),
+        str(entry[1]),
+        entry[2] if len(entry) > 2 else None,
+        str(entry[3]) if len(entry) > 3 and entry[3] is not None else "",
+    )
+
+
 def select_active_user_messages(
-    entries: list[tuple[int, str, float | None]],
+    entries: list[tuple[Any, ...]],
     max_step_gap: int = 20,
     max_seconds_gap: float = 900.0,
-    max_count: int = 3,
+    max_count: int = 5,
 ) -> list[str]:
-    """Keep the latest user message plus earlier messages only if they belong to the same
-    recent interaction (within `max_step_gap` steps and `max_seconds_gap` seconds, or when
-    the newer message is a brief continuation reply like 'yes' / 'continue').
+    """Keep the latest user message plus earlier messages belonging to the same recent interaction.
+
+    When a brief affirmative reply (`yes`, `go ahead`, `already allowed`) follows an agent message,
+    attaches a clearly delimited snippet of the agent's preceding text so Tier 2 sees what was confirmed
+    without ever elevating agent text into user grants.
     """
     if not entries:
         return []
-    selected: list[tuple[int, str, float | None]] = [entries[-1]]
-    for prev in reversed(entries[:-1]):
+    selected: list[tuple[int, str, float | None, str]] = [_unpack_ledger_entry(entries[-1])]
+    for raw_prev in reversed(entries[:-1]):
         if len(selected) >= max_count:
             break
         curr = selected[-1]
+        prev = _unpack_ledger_entry(raw_prev)
         curr_text = curr[1].strip()
-        is_short_followup = len(curr_text) < 40 and bool(
-            re.match(
-                r"^(?:yes|yep|yeah|sure|ok|okay|proceed|continue|keep going|go on|go ahead|do it|sounds good|lgtm)\b",
-                curr_text,
-                re.IGNORECASE,
-            )
-        )
+        is_short_followup = len(curr_text) < 80 and bool(SHORT_AFFIRMATION_RE.match(curr_text))
         step_gap = curr[0] - prev[0]
         time_gap = (
             (curr[2] - prev[2])
@@ -213,7 +226,14 @@ def select_active_user_messages(
             break
         selected.append(prev)
     selected.reverse()
-    return [item[1] for item in selected]
+    out: list[str] = []
+    for _, u_text, _, agent_tail in selected:
+        is_short = len(u_text.strip()) < 80 and bool(SHORT_AFFIRMATION_RE.match(u_text.strip()))
+        if is_short and agent_tail:
+            out.append(f"[Agent context before reply (not user words): ...{agent_tail}] -> [User]: {u_text}")
+        else:
+            out.append(u_text)
+    return out
 
 
 def collect_session_ledger(
@@ -221,9 +241,10 @@ def collect_session_ledger(
     last_user_input: str = "",
     cwd: str = "",
 ) -> dict[str, Any]:
-    """Incrementally scan USER_INPUT and CHECKPOINT steps in transcript.jsonl and build the active verbal grant ledger."""
-    user_messages: list[tuple[int, str, float | None]] = []
+    """Incrementally scan USER_INPUT, PLANNER_RESPONSE, and CHECKPOINT steps in transcript.jsonl."""
+    user_messages: list[tuple[int, str, float | None, str]] = []
     checkpoint_summaries: list[str] = []
+    last_agent_tail = ""
     if transcript_path and transcript_path.is_file():
         try:
             st = transcript_path.stat()
@@ -233,16 +254,14 @@ def collect_session_ledger(
                 try:
                     cached = json.loads(cache_file.read_text(encoding="utf-8"))
                     if (
-                        int(cached.get("inode", -1)) == st.st_ino
+                        int(cached.get("version", 1)) == LEDGER_CACHE_VERSION
+                        and int(cached.get("inode", -1)) == st.st_ino
                         and 0 <= int(cached.get("offset", 0)) <= st.st_size
                     ):
                         start_offset = int(cached["offset"])
+                        last_agent_tail = str(cached.get("last_agent_tail", ""))
                         user_messages = [
-                            (
-                                int(item[0]),
-                                str(item[1]),
-                                float(item[2]) if len(item) > 2 and item[2] is not None else None,
-                            )
+                            _unpack_ledger_entry(tuple(item))
                             for item in cached.get("user_messages", [])
                         ]
                         checkpoint_summaries = [
@@ -250,6 +269,9 @@ def collect_session_ledger(
                         ]
                 except Exception:
                     start_offset = 0
+                    last_agent_tail = ""
+                    user_messages = []
+                    checkpoint_summaries = []
 
             if st.st_size > start_offset:
                 with transcript_path.open("rb") as fh:
@@ -264,7 +286,11 @@ def collect_session_ledger(
                     new_offset = start_offset + len(chunk)
 
                 for raw_line in complete_chunk.splitlines():
-                    if b'"USER_INPUT"' not in raw_line and b'"CHECKPOINT"' not in raw_line:
+                    if (
+                        b'"USER_INPUT"' not in raw_line
+                        and b'"CHECKPOINT"' not in raw_line
+                        and b'"PLANNER_RESPONSE"' not in raw_line
+                    ):
                         continue
                     try:
                         obj = json.loads(raw_line.decode("utf-8", errors="replace"))
@@ -274,8 +300,14 @@ def collect_session_ledger(
                     step_idx = int(obj.get("step_index", 0))
                     if step_type == "USER_INPUT":
                         clean = extract_clean_user_text(str(obj.get("content", "")))
-                        if clean:
-                            user_messages.append((step_idx, clean, _extract_step_timestamp(obj)))
+                        if clean and not clean.startswith("Auto Permissions"):
+                            user_messages.append(
+                                (step_idx, clean, _extract_step_timestamp(obj), last_agent_tail)
+                            )
+                    elif step_type == "PLANNER_RESPONSE":
+                        agent_text = " ".join(str(obj.get("content", "")).split()).strip()
+                        if agent_text:
+                            last_agent_tail = agent_text[-220:]
                     elif "CHECKPOINT" in step_type:
                         cp_text = str(obj.get("content", "")).strip()
                         if cp_text:
@@ -285,8 +317,10 @@ def collect_session_ledger(
                     cache_file.write_text(
                         json.dumps(
                             {
+                                "version": LEDGER_CACHE_VERSION,
                                 "inode": st.st_ino,
                                 "offset": new_offset,
+                                "last_agent_tail": last_agent_tail,
                                 "user_messages": user_messages,
                                 "checkpoint_summaries": checkpoint_summaries[-3:],
                             }
@@ -300,15 +334,20 @@ def collect_session_ledger(
 
     if last_user_input:
         clean_last = extract_clean_user_text(last_user_input)
-        if clean_last and (not user_messages or user_messages[-1][1] != clean_last):
+        if (
+            clean_last
+            and not clean_last.startswith("Auto Permissions")
+            and (not user_messages or user_messages[-1][1] != clean_last)
+        ):
             next_idx = (user_messages[-1][0] + 1) if user_messages else 0
-            user_messages.append((next_idx, clean_last, None))
+            user_messages.append((next_idx, clean_last, None, last_agent_tail))
 
     path_map: dict[str, dict[str, Any]] = {}
     denied_set: set[str] = set()
     commands_set: set[str] = set()
 
-    for step_idx, msg, _ in user_messages:
+    # Security invariant: Tier-1 deterministic path/command grants ONLY scan clean user text, never agent output.
+    for step_idx, msg, _, _ in user_messages:
         extracted = extract_grants_from_text(msg, step_index=step_idx, cwd=cwd)
         for dp in extracted["denied_paths"]:
             denied_set.add(dp)
@@ -330,7 +369,7 @@ def collect_session_ledger(
         "denied_paths": sorted(denied_set),
         "command_grants": sorted(commands_set),
         "recent_user_messages": recent_msgs,
-        "all_user_entries": [(step_idx, msg) for step_idx, msg, _ in user_messages],
+        "all_user_entries": [(step_idx, msg) for step_idx, msg, _, _ in user_messages],
         "last_user_step_index": user_messages[-1][0] if user_messages else 0,
     }
 

@@ -1032,6 +1032,172 @@ class TestPermissionReviewer(unittest.TestCase):
         avg_ms = ((time.perf_counter() - t_start) * 1000.0) / len(bench_cmds)
         self.assertLess(avg_ms, 1.0, msg=f"Average Tier 0 evaluation latency too high: {avg_ms:.3f} ms")
 
+    def test_short_affirmation_context_bundled_push_guard_and_readonly_ssh_cache(self) -> None:
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        ws = "/workspace/project"
+
+        local_cfg = self.tmp_path / "local_ssh.json"
+        local_cfg.write_text(json.dumps({"known_ssh_hosts": ["DevBox"]}), encoding="utf-8")
+        review_hook.os.environ["AGY_PERMISSION_REVIEWER_LOCAL_CONFIG"] = str(local_cfg)
+        self.addCleanup(lambda: review_hook.os.environ.pop("AGY_PERMISSION_REVIEWER_LOCAL_CONFIG", None))
+
+        tp = self.tmp_path / "gpu_bench_session.jsonl"
+        rows: list[dict] = [
+            {
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>\nClone the solver setup and benchmark FluidSolver on the GPU if possible\n</USER_REQUEST>",
+            },
+            {
+                "step_index": 6,
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>\nPlease avoid /tmp for reusable test clones\n</USER_REQUEST>",
+            },
+            {
+                "step_index": 10,
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>\nOnly target my fork later once ready\n</USER_REQUEST>",
+            },
+            {
+                "step_index": 14,
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>\nUse Release flags when building CUDA kernels\n</USER_REQUEST>",
+            },
+            {
+                "step_index": 19,
+                "type": "PLANNER_RESPONSE",
+                "content": (
+                    "Local checks passed. Can I SSH into DevBox (testing in /home/dev/gpu_validation/full_stack_solver), "
+                    "and push dev/FluidSolver if the GPU tests pass?"
+                ),
+            },
+            {
+                "step_index": 20,
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>\nYes I've allowed it already.\n</USER_REQUEST>",
+            },
+        ]
+        # Pad >300 KB of subsequent tool activity so the 256 KB compact tail scrolls past step 19-20.
+        filler = "x" * 2400
+        for s in range(21, 165):
+            rows.append(
+                {
+                    "step_index": s,
+                    "type": "PLANNER_RESPONSE",
+                    "content": "",
+                    "tool_calls": [{"name": "run_command", "args": {"CommandLine": f"echo {filler}"}}],
+                }
+            )
+        tp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        # 1. Ledger keeps the earlier task prompt (max_count=5) and anchors preceding agent question onto short "Yes"
+        ledger = review_hook.collect_session_ledger(tp)
+        recent = ledger["recent_user_messages"]
+        self.assertEqual(len(recent), 5)
+        self.assertIn("Clone the solver setup and benchmark FluidSolver", recent[0])
+        self.assertTrue(recent[-1].startswith("[Agent context before reply (not user words):"))
+        self.assertIn("DevBox", recent[-1])
+        self.assertTrue(recent[-1].endswith("-> [User]: Yes I've allowed it already."))
+
+        # 2. Agent text must NEVER self-mint Tier-1 path grants
+        grant_paths = [pg["path"] for pg in ledger["path_grants"]]
+        self.assertNotIn("/home/dev/gpu_validation/full_stack_solver", grant_paths)
+
+        calls: list[dict] = []
+
+        def capture_allow(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            calls.append(payload)
+            return {"data": {"answers": [{"choice": "allow", "confidence": 0.95}]}}
+
+        # 3. Mutating SSH commands hit Tier 2 (receiving anchored context + knownUserSshHost) and NEVER bypass via SSH cache
+        res_ssh1 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_ssh_session",
+                "workspacePaths": [ws],
+                "transcriptPath": str(tp),
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": 'ssh -o ConnectTimeout=10 DevBox "wsl.exe --distribution Ubuntu --exec python3 /home/dev/test.py"',
+                        "BypassSandbox": True,
+                    },
+                },
+            },
+            api_caller=capture_allow,
+        )
+        self.assertEqual(res_ssh1["decision"], "allow")
+        self.assertEqual(len(calls), 1)
+        req_json = calls[0]["input"][1]["value"]
+        self.assertEqual(req_json["requested_action"]["details"]["sshHost"], "devbox")
+        self.assertTrue(req_json["requested_action"]["details"]["knownUserSshHost"])
+        self.assertTrue(
+            any("DevBox" in m and "Yes I've allowed it already." in m for m in req_json["recent_user_messages"])
+        )
+
+        res_ssh2 = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_ssh_session",
+                "workspacePaths": [ws],
+                "transcriptPath": str(tp),
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": 'ssh -o ConnectTimeout=10 DevBox "wsl.exe --distribution Ubuntu --exec tar -xzf - -C /home/dev/gpu_validation"',
+                        "BypassSandbox": True,
+                    },
+                },
+            },
+            api_caller=capture_allow,
+        )
+        self.assertEqual(res_ssh2["decision"], "allow")
+        self.assertEqual(len(calls), 2, msg="Mutating SSH tar must still be reviewed by Tier 2")
+
+        # 4. Strictly read-only SSH grep on approved host hits session_ssh_readonly_cache (0 LLM calls)
+        res_ro = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_ssh_session",
+                "workspacePaths": [ws],
+                "transcriptPath": str(tp),
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": 'ssh -o ConnectTimeout=10 DevBox "wsl.exe --distribution Ubuntu --exec grep -n error /home/dev/build.log"',
+                        "BypassSandbox": True,
+                    },
+                },
+            },
+            api_caller=capture_allow,
+        )
+        self.assertEqual(res_ro["decision"], "allow")
+        self.assertEqual(len(calls), 2, msg="Read-only SSH check should reuse session_ssh_readonly_cache")
+        audit_lines = [
+            json.loads(ln)
+            for ln in (intent_extractor.get_data_dir() / "audit" / "c_ssh_session.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(audit_lines[-1]["tier"], "session_ssh_readonly_cache")
+
+        # 5. Bundled-proposal trap: remote `git push` over SSH and nested `zsh -lc "gh pr create"` ALWAYS hit Tier 0 force_ask
+        for trap_cmd in (
+            'ssh DevBox "cd /home/dev/repo && git push origin dev/FluidSolver"',
+            '/bin/zsh -lc "gh pr create --title test"',
+        ):
+            res_trap = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_ssh_session",
+                    "workspacePaths": [ws],
+                    "transcriptPath": str(tp),
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": trap_cmd, "BypassSandbox": True}},
+                },
+                api_caller=capture_allow,
+            )
+            self.assertEqual(res_trap["decision"], "ask", msg=f"Expected Tier 0 ask/force_ask for {trap_cmd!r}")
+            self.assertEqual(review_hook.to_antigravity_hook_output(res_trap)["decision"], "force_ask")
+        self.assertEqual(len(calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

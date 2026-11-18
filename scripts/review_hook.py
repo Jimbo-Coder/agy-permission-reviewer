@@ -53,6 +53,7 @@ from llm_classifier import (
     compute_directory_grant_key,
     compute_request_key,
     compute_signature,
+    compute_ssh_host_grant_key,
     extract_compact_transcript,
     find_opencode_binary,
     get_cached_verdict,
@@ -968,6 +969,161 @@ def _has_non_discard_file_redirect(code_only: str) -> bool:
     return bool(extract_shell_output_redirects(code_only))
 
 
+_SSH_ARG_FLAGS = frozenset("BbcDEeFIiJLlmOopQRSWw")
+_SSH_NOARG_FLAGS = frozenset("1246AaCfGgKkMNnqsTtVvXxYy")
+_SSH_SENSITIVE_TOKEN_RE = re.compile(
+    r"(?:\.ssh/|\.aws/|\.gnupg/|\.netrc|(?:^|/|\s)\.env(?:\.(?:local|prod|production|secret))?\b|/etc/(?:shadow|master\.passwd))"
+)
+_SSH_READONLY_SEGMENT_RE = re.compile(
+    r"^(?:"
+    r"(?:ls|tree|wc|du|df|stat|file|which|pwd|whoami|uname|uptime|nproc|ps|pgrep|nvidia-smi|cat|head|tail|grep|rg|dirname|basename|realpath|readlink)(?:\s|$)"
+    r"|git\s+(?:-C\s+\S+\s+)?(?:status|diff|log|show|rev-parse|branch(?:\s+(?:--show-current|-a|-v|-vv|--list))?)(?:\s|$)"
+    r"|echo(?:\s|$)"
+    r"|true$|false$"
+    r")"
+)
+
+
+def _quote_join(tokens: tuple[str, ...] | list[str]) -> str:
+    return " ".join(
+        shlex.quote(tok) if (not tok or " " in tok or any(c in tok for c in "\"'\\;&|<>()\n#")) else tok
+        for tok in tokens
+    )
+
+
+def _parse_ssh_invocation(sanitized_cmd: str) -> tuple[str, str] | None:
+    """Parse a single `ssh` invocation into `(normalized_host, remote_command)`."""
+    parsed = parse_shell_structure(sanitized_cmd)
+    if parsed is None or len(parsed["argv_segments"]) != 1:
+        return None
+    if any(t not in DISCARD_REDIRECT_TARGETS for _, t in parsed["redirects"]):
+        return None
+    argv = parsed["argv_segments"][0]
+    tmp_out: list[str] = []
+    cmd_idx = _consume_leading_wrappers(argv, "", True, tmp_out)
+    if cmd_idx is None or Path(argv[cmd_idx]).name != "ssh":
+        return None
+    args = argv[cmd_idx + 1 :]
+    i = 0
+    n = len(args)
+    dest = ""
+    while i < n:
+        tok = args[i]
+        if tok == "--":
+            if i + 1 < n:
+                dest = args[i + 1]
+                i += 2
+            else:
+                i = n
+            break
+        if tok.startswith("-") and len(tok) > 1:
+            if tok[1] in _SSH_ARG_FLAGS:
+                i += 1 if len(tok) > 2 else 2
+                continue
+            if all(ch in _SSH_NOARG_FLAGS for ch in tok[1:]):
+                i += 1
+                continue
+            return None
+        dest = tok
+        i += 1
+        break
+    if not dest:
+        return None
+    host = dest.split("@", 1)[1] if "@" in dest else dest
+    if host.startswith("[") and "]" in host:
+        host = host[1 : host.index("]")]
+    host = host.strip().lower()
+    if not host or host.startswith("-"):
+        return None
+    # OpenSSH concatenates trailing remote command arguments with spaces before sending to the remote shell.
+    remote_cmd = " ".join(args[i:]).strip() if i < n else ""
+    return host, remote_cmd
+
+
+def _unwrap_wsl_exec(remote_cmd: str) -> str:
+    """Unwrap `wsl.exe [--distribution ...] --exec <cmd...>` into its inner command string."""
+    parsed = parse_shell_structure(remote_cmd)
+    if parsed is None or len(parsed["argv_segments"]) != 1:
+        return remote_cmd
+    argv = parsed["argv_segments"][0]
+    if not argv or Path(argv[0]).name not in ("wsl", "wsl.exe"):
+        return remote_cmd
+    i = 1
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok in ("-e", "--exec"):
+            if i + 1 >= n:
+                return ""
+            return _quote_join(argv[i + 1 :])
+        if tok in ("-d", "--distribution", "-u", "--user", "--cd", "--shell-type"):
+            i += 2
+            continue
+        if tok.startswith(("--distribution=", "--user=", "--cd=")):
+            i += 1
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        break
+    return remote_cmd
+
+
+def _matches_force_ask(sanitized_cmd: str, _depth: int = 0) -> str | None:
+    """Check `FORCE_ASK_COMMAND_PATTERNS` directly and inside nested `sh -c` / `ssh` / `wsl --exec` wrappers."""
+    cleaned = strip_commit_message_literals(strip_purpose_comment(sanitized_cmd))
+    for label, pat in FORCE_ASK_COMMAND_PATTERNS:
+        if pat.search(cleaned):
+            return label
+    if _depth >= 3:
+        return None
+    parsed = parse_shell_structure(cleaned)
+    if parsed is not None:
+        for argv in parsed["argv_segments"]:
+            tmp_out: list[str] = []
+            c_idx = _consume_leading_wrappers(argv, "", True, tmp_out)
+            if c_idx is None:
+                continue
+            if Path(argv[c_idx]).name in _NESTED_SHELL_NAMES:
+                rest = argv[c_idx + 1 :]
+                for j, tok in enumerate(rest):
+                    if re.fullmatch(r"-[a-zA-Z]*c", tok) and j + 1 < len(rest):
+                        found = _matches_force_ask(rest[j + 1], _depth=_depth + 1)
+                        if found:
+                            return found
+                        break
+    ssh_info = _parse_ssh_invocation(cleaned)
+    if ssh_info is not None and ssh_info[1]:
+        remote_cmd = ssh_info[1]
+        found = _matches_force_ask(remote_cmd, _depth=_depth + 1)
+        if found:
+            return found
+        unwrapped = _unwrap_wsl_exec(remote_cmd)
+        if unwrapped != remote_cmd:
+            found = _matches_force_ask(unwrapped, _depth=_depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _is_strictly_readonly_remote_cmd(remote_cmd: str) -> bool:
+    """Return True only when every segment of `remote_cmd` is strictly read-only inspection."""
+    inner = _unwrap_wsl_exec(remote_cmd).strip()
+    if (
+        not inner
+        or UNSAFE_SHELL_EXPANSION_RE.search(inner)
+        or DESTRUCTIVE_SCOPE_COMMAND_RE.search(inner)
+        or _SSH_SENSITIVE_TOKEN_RE.search(inner)
+        or _matches_force_ask(inner)
+        or _has_non_discard_file_redirect(inner)
+    ):
+        return False
+    segments = split_shell_segments(inner)
+    if not segments:
+        return False
+    return all(_SSH_READONLY_SEGMENT_RE.search(_normalize_segment_for_routine(seg)) for seg in segments)
+
+
 def _dir_grant_candidates(path_str: str, include_self: bool = False, max_levels: int = 4) -> list[str]:
     """Return ancestor directories (up to `max_levels`) eligible for `session_dir_cache` grants,
     stopping before root, top-level OS dirs (`/opt`, `/Users`, ...), and `Path.home()`.
@@ -1158,13 +1314,13 @@ def check_tier0_static(
                 ),
                 "tier": "tier0_sandbox_network_mismatch",
             }
-        for label, pat in FORCE_ASK_COMMAND_PATTERNS:
-            if pat.search(sanitized_cmd):
-                return {
-                    "decision": "ask",
-                    "reason": f"[Tier 0 Policy] {label}.",
-                    "tier": "tier0_force_ask",
-                }
+        force_ask_label = _matches_force_ask(sanitized_cmd)
+        if force_ask_label:
+            return {
+                "decision": "ask",
+                "reason": f"[Tier 0 Policy] {force_ask_label}.",
+                "tier": "tier0_force_ask",
+            }
         ok, reason = is_fast_allow_command(
             command=cmd,
             bypass_sandbox=bypass_sandbox,
@@ -1319,6 +1475,17 @@ def build_requested_action(
             "externalPaths": outside_paths,
             "isDestructiveOrDelete": is_destructive_or_delete,
         }
+        ssh_info = _parse_ssh_invocation(code_only)
+        if ssh_info is not None:
+            ssh_host = ssh_info[0]
+            details["sshHost"] = ssh_host
+            known_hosts = {
+                str(h).strip().lower()
+                for h in load_local_config().get("known_ssh_hosts", [])
+                if str(h).strip()
+            }
+            if ssh_host in known_hosts:
+                details["knownUserSshHost"] = True
         if active_grants:
             details["activeVerbalGrants"] = active_grants[-6:]
         if purpose_match:
@@ -1412,13 +1579,16 @@ def evaluate_tool_call(
                     else None
                 )
                 # Also check if a routine command (`git -C <dir>`, `unittest -s <dir>`) or a sandboxed
-                # non-destructive command only references external directories already approved in this session.
+                # non-destructive command only references external directories already approved in this session,
+                # or if a strictly read-only SSH command targets a host already approved in this session.
                 cmd_outside_dirs: list[str] = []
+                ssh_info: tuple[str, str] | None = None
                 if tool_name == "run_command":
                     cmd_str = str(tool_args.get("CommandLine", ""))
                     bypass_sb = bool(tool_args.get("BypassSandbox", False))
                     norm_ws = [normalize_path(p) for p in workspace_paths if p]
                     sanitized = strip_commit_message_literals(strip_purpose_comment(cmd_str))
+                    ssh_info = _parse_ssh_invocation(sanitized)
                     if (
                         (is_routine_command_segments(cmd_str, norm_workspaces=norm_ws) or not bypass_sb)
                         and not DESTRUCTIVE_SCOPE_COMMAND_RE.search(sanitized)
@@ -1477,6 +1647,23 @@ def evaluate_tool_call(
                             "model": "session_dir_cache",
                             "reasonCode": "cached_dir_grant",
                             "reason": "Routine command targets an external directory already approved in this session.",
+                        }
+                if (
+                    cached is None
+                    and ssh_info is not None
+                    and ssh_info[1]
+                    and _is_strictly_readonly_remote_cmd(ssh_info[1])
+                ):
+                    ssh_verdict = get_cached_verdict(
+                        conversation_id, compute_ssh_host_grant_key(ssh_info[0])
+                    )
+                    if ssh_verdict is not None and ssh_verdict.get("effect") == "allow":
+                        cached = {
+                            "effect": "allow",
+                            "source": "cache",
+                            "model": "session_ssh_readonly_cache",
+                            "reasonCode": "cached_ssh_readonly_grant",
+                            "reason": "Read-only SSH inspection on a host already approved in this session.",
                         }
                 if cached is not None:
                     verdict = cached
@@ -1603,6 +1790,12 @@ def evaluate_tool_call(
                                 compute_directory_grant_key(cd),
                                 verdict,
                             )
+                    if ssh_info is not None and cached is None:
+                        put_cached_verdict(
+                            conversation_id,
+                            compute_ssh_host_grant_key(ssh_info[0]),
+                            verdict,
+                        )
 
                 unresolved_mode = os.environ.get("AGY_UNRESOLVED_MODE", "agent")
                 max_sb = int(os.environ.get("AGY_MAX_SEND_BACKS", str(DEFAULT_MAX_SEND_BACKS)))

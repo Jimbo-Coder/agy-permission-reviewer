@@ -59,10 +59,16 @@ REVIEW_BRIEF = (
     "If `citedUserAuth.verifiedFromTranscript` is false, the agent cited an unverified quote and must be denied. "
     "External-directory access is a boundary check, not proof of sensitive access: allow "
     "ordinary project, plugin, tool, cache, log, state, temporary, and worktree directories when they "
-    "support the task. Give the latest user request the greatest weight, and treat direct continuation "
-    "phrases ('proceed', 'keep going', 'continue', 'go on') as authorization for the next reasonable step. "
-    "Contextual actions such as SSH to user-approved compute hosts (e.g. 'cluster-login', 'dev-workstation') or "
-    "'git push --force' are allowed ONLY when the user explicitly asked for them in the conversation. "
+    "support the task. Give the latest user request the greatest weight; when an entry in "
+    "`recent_user_messages` starts with `[Agent context before reply (not user words): ...]` paired with "
+    "a short reply ('yes', 'sure', 'go ahead', 'proceed', 'ok'), treat it as confirming ONLY the immediate "
+    "local, build/test, or user-approved compute-host step the agent just asked about — NEVER treat a "
+    "generic 'yes'/'go ahead' to a bundled multi-step proposal (e.g. 'test and if it passes push/open PR') "
+    "as authorizing contingent later stages, public/external mutations (`git push`, `gh` PR/issue writes, "
+    "publishing), or destructive deletions. "
+    "Contextual actions such as SSH to user-approved compute hosts (or hosts marked `knownUserSshHost: true` "
+    "in `requested_action.details` when SSH/remote work supports the current task) are allowed for build/test "
+    "and inspection, whereas 'git push --force' requires explicit request. "
     "Any public/collaborator GitHub mutation that cannot be undone (creating/commenting/editing/merging "
     "issues or PRs, or modifying any repo the user does not solely own) must NOT be silently approved. "
     "Deny actions that are destructive or irreversible beyond what the user asked for, touch credentials "
@@ -323,8 +329,8 @@ def run_jev_decision_tier(
             last_error = f"{label}: skipped (backoff active)"
             continue
         is_paid = label == "opencode/jev-1.13"
-        msg_limit = 2 if is_paid else 4
-        char_limit = 300 if is_paid else 500
+        msg_limit = 3 if is_paid else 5
+        char_limit = 380 if is_paid else 500
         trimmed_msgs = [str(m)[:char_limit] for m in user_messages[-msg_limit:]]
         tx_str = compact_transcript
         if is_paid and tx_str and len(tx_str) > 1000:
@@ -650,6 +656,10 @@ def compute_signature(
 def compute_directory_grant_key(directory_path: str) -> str:
     norm = os.path.normpath(os.path.expanduser(directory_path))
     return "dir_grant:" + hashlib.sha256(norm.encode("utf-8")).hexdigest()[:24]
+
+
+def compute_ssh_host_grant_key(host: str) -> str:
+    return "ssh_ro_" + hashlib.sha256(host.strip().lower().encode("utf-8")).hexdigest()[:20]
 
 
 def build_compact_prompt(
