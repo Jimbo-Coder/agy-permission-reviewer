@@ -387,8 +387,9 @@ class TestPermissionReviewer(unittest.TestCase):
             raise AssertionError(f"Tier 2 should not run for routine Tier 0 command ({endpoint})")
 
         routine_cases = [
-            ("/usr/bin/git add src/a.py", False),
-            ('/usr/bin/git commit -m "title" -m "body mentioning git push and /etc/passwd"', False),
+            ("/usr/bin/git status --short", False),
+            ("/usr/bin/git add src/a.py", True),
+            ('/usr/bin/git commit -m "title" -m "body mentioning git push and /etc/passwd"', True),
             ('export PATH="/opt/homebrew/bin:/usr/bin:/bin"; /opt/homebrew/bin/uv run pytest 2>&1', True),
             ("/opt/homebrew/bin/gh api repos/org/repo/pulls/1 --jq '.title'", True),
             ("/opt/homebrew/bin/gh pr checks 58 -R org/repo", True),
@@ -482,7 +483,18 @@ class TestPermissionReviewer(unittest.TestCase):
         self.assertEqual(res_ok["decision"], "ask")
         self.assertEqual(review_hook.to_antigravity_hook_output(res_ok)["decision"], "force_ask")
 
-        # Commit message mentioning git pull / gh pr must still fast-allow inside sandbox
+        # Read-only git status inside sandbox and commit message mentioning git pull/gh pr with BypassSandbox=True fast-allow
+        res_status = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_net_sb",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "git status --short", "BypassSandbox": False}},
+            },
+            api_caller=fail_api,
+        )
+        self.assertEqual(res_status["decision"], "allow")
+
         res_commit = review_hook.evaluate_tool_call(
             {
                 "conversationId": "c_net_sb",
@@ -490,7 +502,7 @@ class TestPermissionReviewer(unittest.TestCase):
                 "cwd": ws,
                 "toolCall": {
                     "name": "run_command",
-                    "args": {"CommandLine": 'git commit -m "Document git pull and gh pr flow"', "BypassSandbox": False},
+                    "args": {"CommandLine": 'git commit -m "Document git pull and gh pr flow"', "BypassSandbox": True},
                 },
             },
             api_caller=fail_api,
@@ -719,6 +731,128 @@ class TestPermissionReviewer(unittest.TestCase):
         self.assertEqual(res_cask["decision"], "allow")
         self.assertIn("Tier 0", res_cask["reason"])
         self.assertEqual(len(calls), 3)
+
+    def test_division_path_regex_workspace_git_lock_and_git_rm_r(self) -> None:
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        ws = "/workspace/project"
+
+        def fail_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            raise AssertionError(f"Tier 2 should not run here ({endpoint})")
+
+        # 1. Arithmetic division (sum(vals))/1000.0 and vals[0]/2.5 must NOT extract /1000.0 or /2.5 as external paths
+        res_div = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_blind_spots",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "python3 -c 'vals=[1,2]; print((sum(vals))/1000.0, vals[0]/2.5)'",
+                        "BypassSandbox": False,
+                    },
+                },
+            },
+            api_caller=fail_api,
+        )
+        self.assertEqual(res_div["decision"], "allow")
+        self.assertIn("Tier 0", res_div["reason"])
+
+        # Real /etc/passwd paths inside open(...) or cat "..." must still be extracted and reach Tier 2
+        tier2_calls: list[str] = []
+
+        def fake_deny(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+            tier2_calls.append(endpoint)
+            return {"data": {"answers": [{"choice": "deny", "confidence": 0.97}]}}
+
+        for ext_cmd in ('python3 -c \'open("/etc/passwd")\'', 'cat "/etc/passwd"'):
+            tier2_calls.clear()
+            res_ext = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_blind_spots",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": ext_cmd, "BypassSandbox": False}},
+                },
+                api_caller=fake_deny,
+            )
+            self.assertEqual(res_ext["decision"], "deny")
+            self.assertEqual(len(tier2_calls), 1, msg=f"{ext_cmd!r} failed to extract /etc/passwd!")
+
+        # 2. Workspace git write commands fail in sandbox (BypassSandbox=False) -> Tier 0 bounce,
+        #    while read-only git status/stash list (BypassSandbox=False) and git add/commit (BypassSandbox=True) fast-allow,
+        #    and external git -C /external/repo commit (BypassSandbox=False) is NOT blocked by workspace .git gate.
+        for ws_git_write in ("git add src/a.py", 'git commit -m "msg"'):
+            res_gw = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_blind_spots",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": ws_git_write, "BypassSandbox": False}},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(res_gw["decision"], "deny", msg=f"Expected Tier 0 bounce for sandboxed {ws_git_write!r}")
+            self.assertIn("BypassSandbox=true", res_gw["reason"])
+
+        for ok_git, bypass in (
+            ("git status", False),
+            ("git stash list", False),
+            ("git add src/a.py", True),
+            ('git commit -m "msg"', True),
+        ):
+            res_gok = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_blind_spots",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": ok_git, "BypassSandbox": bypass}},
+                },
+                api_caller=fail_api,
+            )
+            self.assertEqual(res_gok["decision"], "allow", msg=f"Expected Tier 0 allow for {ok_git!r} (bypass={bypass})")
+
+        # External non-workspace git commit with BypassSandbox=False is NOT caught by workspace .git gate (goes to Tier 2)
+        tier2_calls.clear()
+        res_ext_git = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_blind_spots",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": 'git -C /external/repo commit -m "msg"', "BypassSandbox": False},
+                },
+            },
+            api_caller=fake_deny,
+        )
+        self.assertEqual(res_ext_git["decision"], "deny")
+        self.assertEqual(len(tier2_calls), 1)
+
+        # 3. Recursive git rm -r sets isDestructiveOrDelete=True and goes to Tier 2 in both sandbox modes
+        for bypass in (False, True):
+            tier2_calls.clear()
+            res_git_rm = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_blind_spots",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {"CommandLine": "git rm -r src/old_dir", "BypassSandbox": bypass},
+                    },
+                },
+                api_caller=fake_deny,
+            )
+            self.assertEqual(res_git_rm["decision"], "deny")
+            self.assertEqual(len(tier2_calls), 1)
+            act = review_hook.build_requested_action(
+                "run_command",
+                {"CommandLine": "git rm -r src/old_dir", "BypassSandbox": bypass},
+                workspace_paths=[ws],
+                cwd=ws,
+            )
+            self.assertTrue(act["details"]["isDestructiveOrDelete"])
 
 
 if __name__ == "__main__":

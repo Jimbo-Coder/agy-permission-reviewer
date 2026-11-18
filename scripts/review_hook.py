@@ -23,6 +23,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import sys
 import tempfile
 import time
@@ -50,6 +51,7 @@ from llm_classifier import (
     compute_request_key,
     compute_signature,
     extract_compact_transcript,
+    find_opencode_binary,
     get_cached_verdict,
     prune_directory_files,
     put_cached_verdict,
@@ -161,8 +163,123 @@ SCOPED_CONTENT_SEGMENT_RE = re.compile(r"^(?:cat|head|tail|sed|awk|grep|rg|find|
 # Tier 1 path grants alone; they must always go to Tier 2 (LLM review against user messages) so
 # they are blocked unless the user explicitly asked to delete/reset them in the conversation.
 DESTRUCTIVE_SCOPE_COMMAND_RE = re.compile(
-    r"(?:^|[;&|]\s*|\s)(?:(?:\/bin\/)?rm\s+-[^\s]*[rR]|(?:\/bin\/)?rmdir\b|find\b[^;&|]*\s-delete\b|shutil\.rmtree|git\s+(?:-C\s+\S+\s+)?(?:reset\s+--hard|clean\s+-[^\s]*f))"
+    r"(?:^|[;&|]\s*|\s)(?:(?:\/bin\/)?rm\s+-[^\s]*[rR]|(?:\/bin\/)?rmdir\b|find\b[^;&|]*\s-delete\b|shutil\.rmtree|git\s+(?:-[Cc]\s+\S+\s+)?(?:reset\s+--hard|clean\s+-[^\s]*f|rm\s+-[^\s]*r\b))"
 )
+
+_GIT_WRITE_SUBCOMMANDS = frozenset(
+    {
+        "add",
+        "commit",
+        "rm",
+        "mv",
+        "checkout",
+        "switch",
+        "restore",
+        "merge",
+        "rebase",
+        "cherry-pick",
+        "revert",
+        "reset",
+        "clean",
+        "am",
+    }
+)
+_GIT_GLOBAL_ARG_FLAGS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+)
+
+
+def _is_git_segment_mutating(seg: str) -> tuple[bool, str | None]:
+    """Return (is_mutating_git_cmd, explicit_minus_C_repo_arg)."""
+    try:
+        tokens = shlex.split(seg)
+    except ValueError:
+        tokens = seg.split()
+    if not tokens:
+        return False, None
+    idx = 0
+    while idx < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[idx]):
+        idx += 1
+    if idx >= len(tokens) or Path(tokens[idx]).name != "git":
+        return False, None
+    idx += 1
+    repo_arg: str | None = None
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in _GIT_GLOBAL_ARG_FLAGS:
+            if tok == "-C" and idx + 1 < len(tokens):
+                repo_arg = tokens[idx + 1]
+            idx += 2
+            continue
+        if tok.startswith("-C") and len(tok) > 2:
+            repo_arg = tok[2:]
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens):
+        return False, repo_arg
+    subcmd = tokens[idx]
+    rest = tokens[idx + 1 :]
+    if subcmd in _GIT_WRITE_SUBCOMMANDS:
+        return True, repo_arg
+    if subcmd == "stash":
+        return (not rest or rest[0] not in ("list", "show")), repo_arg
+    if subcmd == "branch":
+        has_mut_flag = any(
+            t in ("-d", "-D", "-m", "-M", "--delete", "--move")
+            or (t.startswith("-") and not t.startswith("--") and any(c in t[1:] for c in "dDmM"))
+            for t in rest
+        )
+        return has_mut_flag, repo_arg
+    if subcmd == "tag":
+        is_readonly = any(t in ("-l", "--list", "-v", "--verify", "--contains", "--merged", "--no-merged") for t in rest)
+        if is_readonly:
+            return False, repo_arg
+        has_mut_flag = any(
+            t in ("-d", "-a", "-f", "-s", "--delete", "--annotate", "--force", "--sign")
+            or (t.startswith("-") and not t.startswith("--") and any(c in t[1:] for c in "dafs"))
+            for t in rest
+        )
+        has_positional = any(not t.startswith("-") for t in rest)
+        return (has_mut_flag or has_positional), repo_arg
+    return False, repo_arg
+
+
+def _is_workspace_git_write(sanitized_cmd: str, norm_workspaces: list[str], cwd: str) -> bool:
+    """Return True if a `.git`-mutating command targets an active workspace repository (blocked in sandbox)."""
+    if not norm_workspaces:
+        return False
+    segments = [seg.strip() for seg in COMPOUND_SPLIT_RE.split(sanitized_cmd) if seg.strip()]
+    expanded: list[str] = []
+    for raw_seg in segments:
+        s = _strip_path_env_in_segment(raw_seg)
+        if not s:
+            continue
+        shell_m = re.match(r"^(?:/[\w./-]+/)?(?:ba|z)?sh\s+-[a-zA-Z]*c\s+([\"'])(.*)\1$", s, re.DOTALL)
+        if shell_m:
+            expanded.extend(
+                _strip_path_env_in_segment(sub)
+                for sub in COMPOUND_SPLIT_RE.split(shell_m.group(2))
+                if sub.strip()
+            )
+        else:
+            expanded.append(s)
+    for seg in expanded:
+        is_mut, repo_arg = _is_git_segment_mutating(seg)
+        if not is_mut:
+            continue
+        if repo_arg:
+            repo_dir = normalize_path(repo_arg.strip("\"'"), cwd=cwd)
+        elif cwd:
+            repo_dir = normalize_path(cwd)
+        else:
+            repo_dir = norm_workspaces[0]
+        if any(is_path_under(repo_dir, ws) for ws in norm_workspaces):
+            return True
+    return False
 
 HARD_DENY_COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
@@ -567,14 +684,20 @@ def check_tier0_static(
                     "reason": f"[Tier 0 Policy] Blocked catastrophic command pattern: {label}.",
                     "tier": "tier0_static",
                 }
-        if not bypass_sandbox and SANDBOX_INCOMPATIBLE_COMMAND_RE.search(sanitized_cmd):
+        if not bypass_sandbox and (
+            SANDBOX_INCOMPATIBLE_COMMAND_RE.search(sanitized_cmd)
+            or (
+                not DESTRUCTIVE_SCOPE_COMMAND_RE.search(sanitized_cmd)
+                and _is_workspace_git_write(sanitized_cmd, norm_workspaces, cwd)
+            )
+        ):
             return {
                 "decision": "deny",
                 "reason": (
-                    "[Tier 0 Policy] Command requires network, MPI shared-memory IPC, tmux socket, or host process "
-                    "permissions that deterministically fail inside the macOS sandbox (BypassSandbox=false). "
-                    "Re-issue once with BypassSandbox=true (only after explicit user confirmation for public/remote "
-                    "mutations like git push or gh writes)."
+                    "[Tier 0 Policy] Command requires network, MPI shared-memory IPC, tmux socket, host process, "
+                    "or workspace `.git` write permissions that deterministically fail inside the macOS sandbox "
+                    "(BypassSandbox=false). Re-issue once with BypassSandbox=true (only after explicit user confirmation "
+                    "for public/remote mutations like git push or gh writes)."
                 ),
                 "tier": "tier0_sandbox_network_mismatch",
             }
@@ -1090,6 +1213,100 @@ def to_antigravity_hook_output(res: dict[str, Any]) -> dict[str, Any]:
     if "overwrite" in res and isinstance(res["overwrite"], dict):
         out["overwrite"] = res["overwrite"]
     return out
+
+
+def _find_latest_transcript() -> Path | None:
+    home = Path.home() / ".gemini"
+    if not home.is_dir():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    for app_dir in ("antigravity-cli", "antigravity", "antigravity-ide"):
+        brain_dir = home / app_dir / "brain"
+        if not brain_dir.is_dir():
+            continue
+        for tp in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
+            try:
+                candidates.append((tp.stat().st_mtime, tp))
+            except OSError:
+                continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def build_reviewer_status(args: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Assemble live status, verbal grants, rotated usage/cost summary, and recent audit entries."""
+    params = args or {}
+    tp_str = params.get("transcript_path")
+    tp = Path(tp_str) if tp_str else _find_latest_transcript()
+    ledger = collect_session_ledger(tp)
+    base = get_data_dir()
+    req_cid = str(params.get("conversation_id") or "").strip()
+    audit_entries: list[dict[str, Any]] = []
+    tier_counts: dict[str, int] = {}
+    decision_counts: dict[str, int] = {}
+    audit_dir = base / "audit"
+    if audit_dir.is_dir():
+        target_file: Path | None = None
+        if req_cid:
+            cand = audit_dir / f"{safe_conv_id(req_cid)}.jsonl"
+            if cand.is_file():
+                target_file = cand
+        if target_file is None:
+            files = sorted(audit_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if files:
+                target_file = files[0]
+        if target_file is not None:
+            all_lines = target_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            for ln in all_lines:
+                try:
+                    obj = json.loads(ln)
+                    t_key = str(obj.get("tier", "unknown"))
+                    d_key = str(obj.get("decision", "unknown"))
+                    tier_counts[t_key] = tier_counts.get(t_key, 0) + 1
+                    decision_counts[d_key] = decision_counts.get(d_key, 0) + 1
+                except Exception:
+                    pass
+            for ln in all_lines[-20:]:
+                try:
+                    audit_entries.append(json.loads(ln))
+                except Exception:
+                    pass
+    usage_summary: dict[str, Any] = {"total_calls": 0, "total_cost_usd": 0.0, "by_model": {}, "by_outcome": {}}
+    for usage_file in (base / "usage.jsonl.1", base / "usage.jsonl"):
+        if not usage_file.is_file():
+            continue
+        for ln in usage_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                u = json.loads(ln)
+                usage_summary["total_calls"] += 1
+                usage_summary["total_cost_usd"] = round(
+                    usage_summary["total_cost_usd"] + float(u.get("costUsd", 0.0)), 6
+                )
+                m_key = str(u.get("model", "unknown"))
+                o_key = str(u.get("outcome", "unknown"))
+                usage_summary["by_model"][m_key] = usage_summary["by_model"].get(m_key, 0) + 1
+                usage_summary["by_outcome"][o_key] = usage_summary["by_outcome"].get(o_key, 0) + 1
+            except Exception:
+                pass
+    compact_ledger = {
+        "path_grants": ledger.get("path_grants", []),
+        "denied_paths": ledger.get("denied_paths", []),
+        "command_grants": ledger.get("command_grants", []),
+        "recent_user_messages": ledger.get("recent_user_messages", []),
+        "total_user_messages_in_transcript": len(ledger.get("all_user_entries", [])),
+    }
+    return {
+        "mode": os.environ.get("AGY_REVIEWER_MODE", "opencode"),
+        "model": os.environ.get("AGY_DECISION_MODELS", "opencode/jev-1.13-free"),
+        "opencode_available": find_opencode_binary() is not None,
+        "session_tier_breakdown": tier_counts,
+        "session_decision_breakdown": decision_counts,
+        "llm_usage_summary": usage_summary,
+        "verbal_grant_ledger": compact_ledger,
+        "recent_audit_decisions": audit_entries,
+    }
 
 
 def main() -> int:

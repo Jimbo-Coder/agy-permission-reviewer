@@ -17,7 +17,7 @@ import tempfile
 from typing import Any
 
 USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.DOTALL)
-PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9._\-:/])(?:~|/(?!/)|\.\./)[A-Za-z0-9._/\-]+")
+PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9._\-:/)\]])(?:~|/(?!/)|\.\./)[A-Za-z0-9._/\-]+")
 
 NEGATIVE_CUE_RE = re.compile(
     r"\b(?:do\s+not|don't|never|avoid|forbid|prohibit|except|not\s+touch|hands\s+off)\b",
