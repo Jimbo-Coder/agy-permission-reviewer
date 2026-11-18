@@ -129,9 +129,10 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                     except Exception:
                         pass
         usage_summary: dict[str, Any] = {"total_calls": 0, "total_cost_usd": 0.0, "by_model": {}, "by_outcome": {}}
-        usage_file = base / "usage.jsonl"
-        if usage_file.is_file():
-            for ln in usage_file.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]:
+        for usage_file in (base / "usage.jsonl.1", base / "usage.jsonl"):
+            if not usage_file.is_file():
+                continue
+            for ln in usage_file.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     u = json.loads(ln)
                     usage_summary["total_calls"] += 1

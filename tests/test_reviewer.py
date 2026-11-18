@@ -601,6 +601,44 @@ class TestPermissionReviewer(unittest.TestCase):
         self.assertEqual(res_sibling["decision"], "allow")
         self.assertEqual(len(calls), 3)
 
+        # Exact/dir-sig cache hit logs tier="session_cache" in audit instead of re-attributing to LLM model
+        res_exact_cached = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_py_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "read_file",
+                    "args": {"Path": "/opt/other_proj/secret.py"},
+                },
+            },
+            api_caller=fake_allow,
+        )
+        self.assertEqual(res_exact_cached["decision"], "allow")
+        self.assertEqual(len(calls), 3)
+        audit_rows = [
+            json.loads(ln)
+            for ln in (intent_extractor.get_data_dir() / "audit" / "c_py_cache.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(audit_rows[-1]["tier"], "session_cache")
+
+        # Caskroom prefix + echo segment fast-allow cleanly at Tier 0
+        res_cask = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_py_cache",
+                "workspacePaths": [ws],
+                "cwd": ws,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "/opt/homebrew/Caskroom/tool/1.0/bin/pytest && echo done", "BypassSandbox": True},
+                },
+            },
+            api_caller=fake_allow,
+        )
+        self.assertEqual(res_cask["decision"], "allow")
+        self.assertIn("Tier 0", res_cask["reason"])
+        self.assertEqual(len(calls), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

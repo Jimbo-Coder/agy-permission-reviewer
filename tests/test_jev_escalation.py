@@ -398,7 +398,14 @@ class TestJevEscalationAndSendBack(unittest.TestCase):
             self.assertEqual(res_cached_backoff["decision"], "allow")
             self.assertEqual(seen_subproc_models, ["opencode/jev-1.13"])
 
-        # Verify MCP server reports positive total_cost_usd for the paid jev calls
+        # Verify MCP server aggregates both rotated usage.jsonl.1 and usage.jsonl
+        usage_dir = review_hook.get_data_dir()
+        before_lines = (usage_dir / "usage.jsonl").read_text(encoding="utf-8").splitlines()
+        before_cost = sum(float(json.loads(ln).get("costUsd", 0.0)) for ln in before_lines)
+        (usage_dir / "usage.jsonl.1").write_text(
+            json.dumps({"model": "opencode/jev-1.13", "outcome": "allow", "costUsd": 0.0001}) + "\n",
+            encoding="utf-8",
+        )
         mcp_resp = mcp_reviewer_server.handle_request(
             {
                 "jsonrpc": "2.0",
@@ -408,7 +415,8 @@ class TestJevEscalationAndSendBack(unittest.TestCase):
             }
         )
         status_obj = json.loads(mcp_resp["result"]["content"][0]["text"])
-        self.assertGreater(status_obj["llm_usage_summary"]["total_cost_usd"], 0.0)
+        self.assertEqual(status_obj["llm_usage_summary"]["total_cost_usd"], round(before_cost + 0.0001, 6))
+        self.assertEqual(status_obj["llm_usage_summary"]["total_calls"], len(before_lines) + 1)
 
     def test_escalation_timeout_backoff_switches_to_longcat(self) -> None:
         tp = self._write_transcript(["Check /opt/other_repo/script.sh"])

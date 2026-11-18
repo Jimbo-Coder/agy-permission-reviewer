@@ -90,6 +90,7 @@ STANDARD_BIN_PATHS = (
     "/opt/homebrew/sbin",
     "/opt/homebrew/Cellar",
     "/opt/homebrew/opt",
+    "/opt/homebrew/Caskroom",
     "/Library/Developer/CommandLineTools/usr/bin",
 )
 
@@ -122,7 +123,7 @@ ROUTINE_SEGMENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^go\s+test(?:\s|$)"),
     re.compile(r"^(?:pytest|ruff\s+check|tsc)(?:\s|$)"),
     re.compile(r"^gh\s+(?:pr\s+(?:list|view|checks|diff|status)|issue\s+(?:list|view|status)|run\s+(?:list|view)|repo\s+view)(?:\s|$)"),
-    re.compile(r"^(?:ls|tree|wc|du|df|stat|file|which|pwd|whoami|uname|uptime|nproc|sw_vers|true|false)(?:\s|$)"),
+    re.compile(r"^(?:ls|tree|wc|du|df|stat|file|which|pwd|whoami|uname|uptime|nproc|sw_vers|true|false|echo|printf)(?:\s|$)"),
     re.compile(r"^(?:hostname|date)(?:\s+(?:-[sf]|\+\S+))?$"),
 ]
 
@@ -843,6 +844,8 @@ def evaluate_tool_call(
                     sig_cached = get_cached_verdict(conversation_id, dir_sig)
                     if sig_cached is not None and sig_cached.get("effect") == "allow":
                         cached = sig_cached
+                if cached is not None:
+                    cached = {**cached, "source": "cache", "model": "session_cache"}
                 if cached is None and is_file_tool:
                     raw_p = str(
                         tool_args.get("Path")
