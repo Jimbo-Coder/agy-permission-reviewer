@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT:-$HOME/.gemini/config/plugins/agy-permission-reviewer}/scripts/review_hook.py\"",
+            "command": "\"./scripts/run_hook.cmd\"",
             "timeout": 20
           }
         ]

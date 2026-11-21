@@ -13,7 +13,8 @@ Shell commands and out-of-workspace file actions that need approval are judged b
    - Split chained (`&&`, `;`, `|`) commands into single-purpose steps
    - Run a read-only check first if appropriate
    - Add a non-tautological `# purpose: <why this is needed for the user's goal>` comment if the intent is not obvious from the command itself
-   - If the command is authorized by an earlier user message from many turns ago that was filtered out of the active turn, cite it with `# auth: "<exact user phrase>"` (or `# auth: step <N>`); the hook deterministically verifies the quote against `transcript.jsonl` (unverified quotes are flagged as fake)
+   - If the command is authorized by an earlier user message from many turns ago that was filtered out of the active turn, cite it with `# auth: "<exact user phrase>"` (or `# auth: step <N>`); the hook deterministically verifies the quote against `transcript.jsonl` (unverified quotes are flagged as fake). This is not needed when the user just replied in the latest turn.
+   - If the user explicitly authorized a sensitive one-time action (in the latest turn or via a verified `# auth:` citation) and the fast reviewer still denied it, append `# appeal` once to route to deep review (never use `# appeal` without genuine user authorization).
 
 3. **Persistent SSH & `tmux` Sessions + Personal LAN vs. Shared HPC Hygiene**:
    - **No SSH Connection Spam**: Establish a single persistent session (via `tmux`, SSH `ControlMaster`, or a backgrounded `ssh` task driven with `manage_task(Action="send_input")`) rather than firing repeated one-off `ssh` commands—especially on HPC login nodes where connection spam triggers rate limits or 2FA.

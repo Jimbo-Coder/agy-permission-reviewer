@@ -65,7 +65,7 @@ def normalize_path(path_str: str, cwd: str = "") -> str:
 def _is_valid_prose_grant_target(norm_path: str) -> bool:
     """Reject root/home/shallow system dirs so accidental mentions cannot mint broad grants."""
     p = Path(norm_path)
-    if not p.is_absolute():
+    if not os.path.isabs(norm_path):
         return False
     if is_path_under(norm_path, "/private/tmp"):
         return len(p.parts) >= 4
@@ -173,10 +173,28 @@ def _ledger_cache_file(transcript_path: Path) -> Path:
 from datetime import datetime
 
 METADATA_TIME_RE = re.compile(r"The current local time is:\s*([0-9T:\-+Z.]+)")
-LEDGER_CACHE_VERSION = 2
+LEDGER_CACHE_VERSION = 3
 SHORT_AFFIRMATION_RE = re.compile(
     r"^(?:yes|yep|yeah|yup|sure|ok|okay|proceed|continue|keep going|go on|go ahead|do it|sounds good|lgtm|approved|i'?ve allowed|already allowed)\b",
     re.IGNORECASE,
+)
+EXPLICIT_PERMISSION_REPLY_RE = re.compile(
+    r"(?:^(?:yes|yep|yeah|yup|sure|ok|okay|proceed|continue|keep going|go on|go ahead|do it|sounds good|lgtm|approved|i'?ve allowed|already allowed)\b"
+    r"|\b(?:explicit(?:ly)?\s+(?:permission|approval|approv\w+|authoriz\w+)|give\s+you\s+(?:explicit\s+)?(?:permission|approval)|giving\s+you\s+(?:explicit\s+)?(?:permission|approval)|you\s+have\s+(?:my\s+)?(?:explicit\s+)?(?:permission|approval)|i\s+(?:explicitly\s+)?(?:approve|authorize)\b))",
+    re.IGNORECASE,
+)
+
+_RELEVANT_STOPWORDS = frozenset(
+    {
+        "tmp", "bin", "usr", "var", "opt", "etc", "home", "users", "user", "private", "local",
+        "src", "lib", "git", "python", "python3", "bash", "zsh", "ssh", "scp", "sftp", "rsync",
+        "curl", "wget", "cat", "head", "tail", "grep", "find", "sed", "awk", "echo", "true",
+        "false", "test", "tests", "log", "logs", "file", "files", "main", "run", "check",
+        "status", "diff", "build", "dist", "out", "data", "config", "json", "yaml", "yml",
+        "toml", "txt", "md", "py", "sh", "com", "org", "net", "http", "https", "none", "null",
+        "purpose", "auth", "appeal", "review", "deep", "step", "latest", "target", "include",
+        "command", "batchmode", "yes", "no",
+    }
 )
 
 
@@ -210,18 +228,12 @@ def _unpack_ledger_entry(
     )
 
 
-def select_active_user_messages(
+def _select_active_user_entries(
     entries: list[tuple[Any, ...]],
     max_step_gap: int = 20,
     max_seconds_gap: float = 900.0,
     max_count: int = 5,
-) -> list[str]:
-    """Keep the latest user message plus earlier messages belonging to the same recent interaction.
-
-    When a brief affirmative reply (`yes`, `go ahead`, `already allowed`) follows an agent message,
-    attaches a clearly delimited snippet of the agent's preceding text so Tier 2 sees what was confirmed
-    without ever elevating agent text into user grants.
-    """
+) -> list[tuple[int, str, float | None, str]]:
     if not entries:
         return []
     selected: list[tuple[int, str, float | None, str]] = [_unpack_ledger_entry(entries[-1])]
@@ -247,11 +259,38 @@ def select_active_user_messages(
             break
         selected.append(prev)
     selected.reverse()
+    return selected
+
+
+def select_active_user_messages(
+    entries: list[tuple[Any, ...]],
+    max_step_gap: int = 20,
+    max_seconds_gap: float = 900.0,
+    max_count: int = 5,
+) -> list[str]:
+    """Keep the latest user message plus earlier messages belonging to the same recent interaction.
+
+    When a brief affirmative reply or explicit-permission reply follows an agent message,
+    attaches a clearly delimited snippet of the agent's preceding proposal so Tier 2 sees what was
+    confirmed without ever elevating agent text into user grants or clipping the user's words.
+    """
+    selected = _select_active_user_entries(
+        entries,
+        max_step_gap=max_step_gap,
+        max_seconds_gap=max_seconds_gap,
+        max_count=max_count,
+    )
     out: list[str] = []
     for _, u_text, _, agent_tail in selected:
-        is_short = len(u_text.strip()) < 80 and bool(SHORT_AFFIRMATION_RE.match(u_text.strip()))
-        if is_short and agent_tail:
-            out.append(f"[Agent context before reply (not user words): ...{agent_tail}] -> [User]: {u_text}")
+        stripped = u_text.strip()
+        is_short = len(stripped) < 80 and bool(SHORT_AFFIRMATION_RE.match(stripped))
+        is_explicit_perm = len(stripped) < 260 and bool(EXPLICIT_PERMISSION_REPLY_RE.search(stripped))
+        if (is_short or is_explicit_perm) and agent_tail:
+            prefix = "[Agent context before reply (not user words): ..."
+            mid = "] -> [User]: "
+            avail = max(120, min(280, 495 - len(prefix) - len(mid) - len(u_text)))
+            snippet = agent_tail[-avail:]
+            out.append(f"{prefix}{snippet}{mid}{u_text}")
         else:
             out.append(u_text)
     return out
@@ -266,6 +305,7 @@ def collect_session_ledger(
     user_messages: list[tuple[int, str, float | None, str]] = []
     checkpoint_summaries: list[str] = []
     last_agent_tail = ""
+    latest_step_index = 0
     if transcript_path and transcript_path.is_file():
         try:
             st = transcript_path.stat()
@@ -281,6 +321,7 @@ def collect_session_ledger(
                     ):
                         start_offset = int(cached["offset"])
                         last_agent_tail = str(cached.get("last_agent_tail", ""))
+                        latest_step_index = int(cached.get("latest_step_index", 0))
                         user_messages = [
                             _unpack_ledger_entry(tuple(item))
                             for item in cached.get("user_messages", [])
@@ -291,6 +332,7 @@ def collect_session_ledger(
                 except Exception:
                     start_offset = 0
                     last_agent_tail = ""
+                    latest_step_index = 0
                     user_messages = []
                     checkpoint_summaries = []
 
@@ -319,6 +361,7 @@ def collect_session_ledger(
                         continue
                     step_type = obj.get("type", "")
                     step_idx = int(obj.get("step_index", 0))
+                    latest_step_index = max(latest_step_index, step_idx)
                     if step_type == "USER_INPUT":
                         clean = extract_clean_user_text(str(obj.get("content", "")))
                         if clean and not clean.startswith("Auto Permissions"):
@@ -328,7 +371,7 @@ def collect_session_ledger(
                     elif step_type == "PLANNER_RESPONSE":
                         agent_text = " ".join(str(obj.get("content", "")).split()).strip()
                         if agent_text:
-                            last_agent_tail = agent_text[-220:]
+                            last_agent_tail = agent_text[-800:]
                     elif "CHECKPOINT" in step_type:
                         cp_text = str(obj.get("content", "")).strip()
                         if cp_text:
@@ -342,6 +385,7 @@ def collect_session_ledger(
                                 "inode": st.st_ino,
                                 "offset": new_offset,
                                 "last_agent_tail": last_agent_tail,
+                                "latest_step_index": latest_step_index,
                                 "user_messages": user_messages,
                                 "checkpoint_summaries": checkpoint_summaries[-3:],
                             }
@@ -360,8 +404,12 @@ def collect_session_ledger(
             and not clean_last.startswith("Auto Permissions")
             and (not user_messages or user_messages[-1][1] != clean_last)
         ):
-            next_idx = (user_messages[-1][0] + 1) if user_messages else 0
+            next_idx = max(
+                (user_messages[-1][0] + 1) if user_messages else 0,
+                (latest_step_index + 1) if latest_step_index > 0 else 0,
+            )
             user_messages.append((next_idx, clean_last, None, last_agent_tail))
+            latest_step_index = max(latest_step_index, next_idx)
 
     path_map: dict[str, dict[str, Any]] = {}
     denied_set: set[str] = set()
@@ -389,6 +437,8 @@ def collect_session_ledger(
             for cg in extracted["command_grants"]:
                 commands_set.add(cg)
 
+    active_entries = _select_active_user_entries(user_messages)
+    active_step_indices = [entry[0] for entry in active_entries]
     recent_msgs = select_active_user_messages(user_messages)
     if checkpoint_summaries and not recent_msgs:
         recent_msgs = [f"[Active Session Summary]: {checkpoint_summaries[-1][:1500]}"]
@@ -399,41 +449,158 @@ def collect_session_ledger(
         "command_grants": sorted(commands_set),
         "recent_user_messages": recent_msgs,
         "all_user_entries": [(step_idx, msg) for step_idx, msg, _, _ in user_messages],
+        "all_user_entries_with_context": [
+            (step_idx, msg, agent_tail) for step_idx, msg, _, agent_tail in user_messages
+        ],
         "last_user_step_index": user_messages[-1][0] if user_messages else 0,
+        "latest_step_index": latest_step_index,
+        "active_user_step_indices": active_step_indices,
     }
+
+
+def _extract_query_tokens(query_text: str) -> list[tuple[str, bool]]:
+    """Return distinctive lowercase `(token, is_distinctive)` pairs from a tool target/command."""
+    tokens: dict[str, bool] = {}
+
+    def _add(tok: str, distinctive: bool = False) -> None:
+        t = tok.strip("._-").lower() if not distinctive else tok.lower()
+        if not t or t in _RELEVANT_STOPWORDS:
+            return
+        if distinctive:
+            if len(t) >= 3:
+                tokens[t] = True
+            return
+        if len(t) >= 4:
+            tokens[t] = tokens.get(t, False)
+
+    for hm in re.finditer(r"(?<![A-Za-z0-9._-])([A-Za-z0-9._-]{3,}):(?:/|\\|~)", query_text):
+        host = hm.group(1).lower()
+        if host not in ("http", "https", "file", "ssh", "scp", "sftp", "rsync"):
+            _add(host, distinctive=True)
+
+    for raw in re.split(r"[^A-Za-z0-9._/-]+", query_text):
+        if not raw:
+            continue
+        if "/" in raw:
+            base = raw.rsplit("/", 1)[-1]
+            if base and base not in _RELEVANT_STOPWORDS.union({"."} ):
+                is_dist = ("." in base or "-" in base) and len(base) >= 3
+                _add(base, distinctive=is_dist)
+                if "." in base:
+                    stem = base.split(".", 1)[0]
+                    _add(stem, distinctive=False)
+        for part in raw.split("/"):
+            if not part:
+                continue
+            is_dist = ("." in part or "-" in part) and len(part) >= 3
+            _add(part, distinctive=is_dist)
+            if "." in part:
+                _add(part.split(".", 1)[0], distinctive=False)
+
+    return list(tokens.items())
+
+
+def _token_in_text(tok: str, text_low: str) -> bool:
+    if len(tok) <= 4:
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", text_low))
+    return tok in text_low
+
+
+def extract_relevant_earlier_user_turns(
+    query_text: str,
+    all_user_entries_with_context: list[tuple[Any, ...]],
+    exclude_step_indices: set[int] | list[int] | None = None,
+    max_matches: int = 2,
+) -> list[str]:
+    """Zero-token retrieval of older USER_INPUT turns relevant to the current command/targets."""
+    if not query_text or not all_user_entries_with_context:
+        return []
+    q_tokens = _extract_query_tokens(query_text)
+    if not q_tokens:
+        return []
+    exclude_set = set(exclude_step_indices or ())
+    scored: list[tuple[int, int, str]] = []
+    for raw_entry in all_user_entries_with_context:
+        sidx = int(raw_entry[0])
+        if sidx in exclude_set:
+            continue
+        msg = str(raw_entry[1])
+        agent_tail = str(raw_entry[2]) if len(raw_entry) > 2 and raw_entry[2] is not None else ""
+        msg_low = msg.lower()
+        tail_low = agent_tail.lower() if agent_tail else ""
+        score = 0
+        matched_in_msg: set[str] = set()
+        for tok, _ in q_tokens:
+            if _token_in_text(tok, msg_low):
+                score += 2
+                matched_in_msg.add(tok)
+        has_explicit_confirm = bool(EXPLICIT_PERMISSION_REPLY_RE.search(msg))
+        if has_explicit_confirm and tail_low:
+            for tok, _ in q_tokens:
+                if tok not in matched_in_msg and _token_in_text(tok, tail_low):
+                    score += 1
+        if score < 2:
+            continue
+        if agent_tail and has_explicit_confirm:
+            formatted = (
+                f"[Earlier relevant user turn (step #{sidx}) — Agent proposal (untrusted): "
+                f"...{agent_tail[-220:]} -> [User]: {msg[:220]}]"
+            )
+        else:
+            formatted = f"[Earlier relevant user turn (step #{sidx})]: {msg[:420]}"
+        scored.append((score, sidx, formatted))
+
+    if not scored:
+        return []
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in scored[:max_matches]]
 
 
 def verify_cited_user_authorization(
     auth_ref: str,
-    all_user_entries: list[tuple[int, str]],
+    all_user_entries: list[tuple[Any, ...]],
 ) -> dict[str, Any]:
     """Verify an agent's `# auth: <step# or exact user substring>` against real USER_INPUT records in transcript.jsonl."""
     ref = auth_ref.strip().strip("\"'")
     if not ref:
         return {}
+    unpacked: list[tuple[int, str, str]] = [
+        (
+            int(entry[0]),
+            str(entry[1]),
+            str(entry[2]) if len(entry) > 2 and entry[2] is not None else "",
+        )
+        for entry in all_user_entries
+    ]
     step_m = re.match(r"^(?:step\s*#?\s*)?(\d+)$", ref, re.IGNORECASE)
     if step_m:
         target_step = int(step_m.group(1))
-        for step_idx, msg in all_user_entries:
+        for step_idx, msg, agent_tail in unpacked:
             if step_idx == target_step:
-                return {
+                out: dict[str, Any] = {
                     "verifiedFromTranscript": True,
                     "stepIndex": step_idx,
                     "exactUserMessage": msg[:500],
                 }
+                if agent_tail:
+                    out["precedingAgentProposal"] = agent_tail[-500:]
+                return out
         return {
             "verifiedFromTranscript": False,
             "warning": f"Agent cited step #{target_step}, which does not exist as a USER_INPUT in transcript.jsonl",
         }
     if len(ref) >= 5:
         needle = ref.lower()
-        for step_idx, msg in reversed(all_user_entries):
+        for step_idx, msg, agent_tail in reversed(unpacked):
             if needle in msg.lower():
-                return {
+                out = {
                     "verifiedFromTranscript": True,
                     "stepIndex": step_idx,
                     "exactUserMessage": msg[:500],
                 }
+                if agent_tail:
+                    out["precedingAgentProposal"] = agent_tail[-500:]
+                return out
     return {
         "verifiedFromTranscript": False,
         "warning": f"Agent cited phrase {ref!r}, which was NOT found in any USER_INPUT in transcript.jsonl",
@@ -442,14 +609,22 @@ def verify_cited_user_authorization(
 
 def is_path_under(target: str, parent: str) -> bool:
     """Return True if `target` is equal to or inside directory `parent`."""
-    t = os.path.normpath(target)
-    p = os.path.normpath(parent)
+    t = os.path.normcase(os.path.normpath(target))
+    p = os.path.normcase(os.path.normpath(parent))
     if t == p:
         return True
-    return t.startswith(p.rstrip("/") + "/")
+    sep = os.sep
+    p_clean = p.rstrip("/\\")
+    if not p_clean:
+        return t.startswith("/")
+    if len(p_clean) == 2 and p_clean[1] == ":" and sep == "\\":
+        return t.startswith(p_clean + "\\")
+    return t.startswith(p_clean + sep)
 
 
 _URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+_WIN_DRIVE_START_RE = re.compile(r"^[A-Za-z]:[/\\]")
+_WIN_DRIVE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_:/])[A-Za-z]:[/\\][^\s\"';&|<>()]+")
 _SHELL_META_CHARS = frozenset("\"'\\;&|<>()\n#")
 _PUNCT_CHARS = "();<>|&\n"
 _SHELL_OP_RE = re.compile(r"&>>|&>|>>|<<<|<<|<&|<>|>&|>\||\|\||&&|\|&|[();<>|&\n]")
@@ -484,11 +659,12 @@ def extract_paths_from_string(
         return [normalize_path(s, cwd=cwd)]
     if s in ("~", ".."):
         return [normalize_path(s, cwd=cwd)]
+    is_win_abs = bool(_WIN_DRIVE_START_RE.match(s))
     if (
-        s.startswith(("/", "~/", "../"))
+        (s.startswith(("/", "~/", "../")) or is_win_abs)
         and not s.startswith("//")
         and "\n" not in s
-        and len(s.strip("/")) > 0
+        and len(s.strip("/\\")) > 0
     ):
         if " " not in s and "\t" not in s:
             return [normalize_path(s, cwd=cwd)]
@@ -496,14 +672,21 @@ def extract_paths_from_string(
         has_whitespace_path = any(
             m.start() > 0 and s[m.start() - 1].isspace()
             for m in PATH_TOKEN_RE.finditer(s)
+        ) or any(
+            m.start() > 0 and s[m.start() - 1].isspace()
+            for m in _WIN_DRIVE_PATH_RE.finditer(s)
         )
         if not has_shell_op and not has_whitespace_path:
             return [normalize_path(s, cwd=cwd)]
-    return [
+    found = [
         normalize_path(m.group(0), cwd=cwd)
         for m in PATH_TOKEN_RE.finditer(s)
         if len(m.group(0)) >= 3
     ]
+    if ":" in s:
+        for wm in _WIN_DRIVE_PATH_RE.finditer(s):
+            found.append(normalize_path(wm.group(0), cwd=cwd))
+    return found
 
 
 @functools.lru_cache(maxsize=64)

@@ -19,6 +19,7 @@ Architecture (adapted from `opencode-auto-permissions` and `onkarbadve/agy-auto`
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,7 @@ from intent_extractor import (
     collect_session_ledger,
     extract_paths_from_string,
     extract_python_code_paths,
+    extract_relevant_earlier_user_turns,
     get_data_dir,
     is_path_under,
     normalize_path,
@@ -43,6 +45,7 @@ from intent_extractor import (
 from llm_classifier import (
     DEFAULT_DECISION_MODELS,
     DEFAULT_DECISION_TIMEOUT_SEC,
+    DEFAULT_DEEP_REVIEW_TIMEOUT_SEC,
     DEFAULT_ESCALATION_MODELS,
     DEFAULT_ESCALATION_TIMEOUT_SEC,
     DEFAULT_MAX_SEND_BACKS,
@@ -50,6 +53,7 @@ from llm_classifier import (
     DEFAULT_PAID_FALLBACK_MODELS,
     ROTATE_BYTES,
     apply_unresolved_send_back,
+    check_and_record_appeal_quota,
     compute_directory_grant_key,
     compute_request_key,
     compute_signature,
@@ -298,11 +302,11 @@ HARD_DENY_COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
     (
         "Direct private SSH key or cloud secret file read",
-        re.compile(r"(?:\.ssh/id_(?:rsa|ed25519|ecdsa|dsa)|\.aws/credentials|\.netrc|(?:^|/|\s)\.env(?:\.(?:local|prod|production|secret))?(?:\s|$|[\"']))"),
+        re.compile(r"(?:\.ssh[/\\]id_(?:rsa|ed25519|ecdsa|dsa)|\.aws[/\\]credentials|\.netrc|(?:^|[/\\]|\s)\.env(?:\.(?:local|prod|production|secret))?(?:\s|$|[\"']))"),
     ),
     (
         "Modifying Antigravity settings.json or config.json directly",
-        re.compile(r"\.gemini/(?:antigravity-cli/settings\.json|config/(?:config|permission_reviewer\.local)\.json)"),
+        re.compile(r"\.gemini[/\\](?:antigravity-cli[/\\]settings\.json|config[/\\](?:config|permission_reviewer\.local)\.json)"),
     ),
     (
         "Pipe-to-shell remote execution or dynamic library injection hijack",
@@ -385,6 +389,7 @@ PROTECTED_WRITE_PATHS = (
     os.path.expanduser("~/.bash_profile"),
     os.path.expanduser("~/.profile"),
     os.path.expanduser("~/.gemini/config/permission_reviewer.local.json"),
+    *((os.environ.get("WINDIR") or r"C:\Windows",) if os.name == "nt" else ()),
 )
 
 SENSITIVE_READ_PATHS = (
@@ -422,12 +427,75 @@ def record_audit_entry(conversation_id: str, entry: dict[str, Any]) -> None:
         prune_directory_files(af.parent.parent / "ledger_cache", "*.json")
         prune_directory_files(af.parent.parent, "cache_*.json")
         prune_directory_files(af.parent.parent, "sendbacks_*.json")
+        prune_directory_files(af.parent.parent, "appeals_*.json")
     except OSError:
         pass
 
 
 def strip_purpose_comment(command: str) -> str:
-    return re.sub(r"\s+#\s*(?:purpose|auth):.*$", "", command.strip(), flags=re.IGNORECASE)
+    return re.sub(
+        r"(?:\n|[ \t]+)#\s*(?:(?:purpose|auth|review)\s*:|appeal\b)[^\n]*$",
+        "",
+        command.strip(),
+        flags=re.IGNORECASE,
+    )
+
+
+def _parse_review_annotations(command: str) -> dict[str, Any]:
+    stripped = command.strip()
+    tail = stripped.rsplit("\n", 1)[-1] if stripped else ""
+    auth_m = re.search(
+        r"#\s*auth:\s*(.+?)(?=\s+#\s*(?:purpose|review)\s*:|\s+#\s*appeal\b|$)",
+        tail,
+        flags=re.IGNORECASE,
+    )
+    purpose_m = re.search(
+        r"#\s*purpose:\s*(.+?)(?=\s+#\s*(?:auth|review)\s*:|\s+#\s*appeal\b|$)",
+        tail,
+        flags=re.IGNORECASE,
+    )
+    appeal_requested = bool(
+        re.search(
+            r"(?:^|\s)#\s*(?:appeal\b|review\s*:\s*(?:deep|escalate)\b)",
+            tail,
+            flags=re.IGNORECASE,
+        )
+    )
+    return {
+        "auth": auth_m.group(1).strip() if auth_m else "",
+        "purpose": purpose_m.group(1).strip() if purpose_m else "",
+        "appeal_requested": appeal_requested,
+    }
+
+
+def _resolve_model_list(
+    env_var: str,
+    local_cfg: dict[str, Any],
+    cfg_key: str,
+    default_models: list[str],
+    append_fallbacks: list[str] | None = None,
+) -> list[str]:
+    """Resolve model list from env -> local config -> defaults, optionally appending free fallbacks."""
+    if env_var in os.environ:
+        env_val = os.environ[env_var].strip()
+        if not env_val:
+            return []
+        models = [m.strip() for m in env_val.split(",") if m.strip()]
+    else:
+        raw_cfg = local_cfg.get(cfg_key)
+        if isinstance(raw_cfg, list):
+            models = [str(m).strip() for m in raw_cfg if str(m).strip()]
+        elif isinstance(raw_cfg, str) and raw_cfg.strip():
+            models = [m.strip() for m in raw_cfg.split(",") if m.strip()]
+        else:
+            models = list(default_models)
+    if append_fallbacks:
+        seen = set(models)
+        for fb in append_fallbacks:
+            if fb not in seen:
+                models.append(fb)
+                seen.add(fb)
+    return models
 
 
 def strip_commit_message_literals(command: str) -> str:
@@ -991,6 +1059,103 @@ def _quote_join(tokens: tuple[str, ...] | list[str]) -> str:
     )
 
 
+_SCP_SFTP_ARG_OPTS = frozenset(
+    {"-c", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-D", "-b", "-B", "-R", "-s"}
+)
+_RSYNC_ARG_OPTS = frozenset(
+    {
+        "-e", "-f", "--rsh", "--rsync-path", "--exclude", "--include", "--exclude-from",
+        "--include-from", "--files-from", "--log-file", "--password-file", "--port",
+        "--address", "--bwlimit", "--timeout", "--contimeout", "--temp-dir",
+        "--compare-dest", "--copy-dest", "--link-dest", "--backup-dir", "--suffix",
+        "--chmod", "--chown", "--usermap", "--groupmap", "--iconv", "--max-size",
+        "--min-size", "--modify-window", "--block-size", "--out-format", "--info",
+        "--debug", "--filter",
+    }
+)
+_REMOTE_URL_HOST_RE = re.compile(r"^(?:scp|sftp|rsync)://([^/]+)(?:/|$)", re.IGNORECASE)
+
+
+def _normalize_remote_host(raw_host: str, from_url: bool = False) -> str:
+    h = raw_host.strip()
+    if "@" in h:
+        h = h.split("@", 1)[1]
+    if h.startswith("[") and "]" in h:
+        h = h[1 : h.index("]")]
+    elif from_url and ":" in h:
+        h = h.split(":", 1)[0]
+    h = h.strip().lower()
+    if not h or h.startswith("-") or "/" in h or "\\" in h:
+        return ""
+    return h
+
+
+def _extract_remote_transfer_hosts(sanitized_cmd: str) -> list[str]:
+    """Extract normalized remote hosts from `scp`, `sftp`, or `rsync` command segments."""
+    parsed = parse_shell_structure(sanitized_cmd)
+    if parsed is None:
+        return []
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for argv in parsed["argv_segments"]:
+        tmp_out: list[str] = []
+        cmd_idx = _consume_leading_wrappers(argv, "", True, tmp_out)
+        if cmd_idx is None:
+            continue
+        cmd_name = Path(argv[cmd_idx]).name
+        if cmd_name not in ("scp", "sftp", "rsync"):
+            continue
+        arg_opts = _RSYNC_ARG_OPTS if cmd_name == "rsync" else _SCP_SFTP_ARG_OPTS
+        args = argv[cmd_idx + 1 :]
+        i = 0
+        n = len(args)
+        end_opts = False
+        while i < n:
+            tok = args[i]
+            if not end_opts:
+                if tok == "--":
+                    end_opts = True
+                    i += 1
+                    continue
+                if tok in arg_opts:
+                    i += 2
+                    continue
+                if tok.startswith("--") and "=" in tok:
+                    i += 1
+                    continue
+                if cmd_name in ("scp", "sftp") and tok.startswith("-") and len(tok) > 2 and tok[:2] in _SCP_SFTP_ARG_OPTS:
+                    i += 1
+                    continue
+                if cmd_name == "rsync" and tok.startswith("-") and not tok.startswith("--") and len(tok) > 2 and tok[:2] in ("-e", "-f"):
+                    i += 1
+                    continue
+                if tok.startswith("-") and tok != "-":
+                    i += 1
+                    continue
+            if tok in ("~", ".", "..", "-") or tok.startswith(("/", "~/", "./", "../")):
+                i += 1
+                continue
+            low_tok = tok.lower()
+            if low_tok.startswith(("http://", "https://", "file://")):
+                i += 1
+                continue
+            url_m = _REMOTE_URL_HOST_RE.match(tok)
+            cand = ""
+            if url_m:
+                cand = _normalize_remote_host(url_m.group(1), from_url=True)
+            elif ":" in tok:
+                host_part, _ = tok.split(":", 1)
+                if "@" in host_part or len(host_part) >= 2:
+                    cand = _normalize_remote_host(host_part)
+            elif cmd_name == "sftp" and "@" in tok and "/" not in tok:
+                cand = _normalize_remote_host(tok)
+            if cand and cand not in seen:
+                seen.add(cand)
+                hosts.append(cand)
+            i += 1
+    return hosts
+
+
 def _parse_ssh_invocation(sanitized_cmd: str) -> tuple[str, str] | None:
     """Parse a single `ssh` invocation into `(normalized_host, remote_command)`."""
     parsed = parse_shell_structure(sanitized_cmd)
@@ -1327,7 +1492,7 @@ def check_tier0_static(
                     "reason": f"[Tier 0 Policy] Blocked catastrophic command pattern: {label}.",
                     "tier": "tier0_static",
                 }
-        if not bypass_sandbox and (
+        if sys.platform == "darwin" and not bypass_sandbox and (
             SANDBOX_INCOMPATIBLE_COMMAND_RE.search(sanitized_cmd)
             or (
                 not DESTRUCTIVE_SCOPE_COMMAND_RE.search(sanitized_cmd)
@@ -1492,12 +1657,7 @@ def build_requested_action(
         cmd = str(tool_args.get("CommandLine", ""))
         bypass = bool(tool_args.get("BypassSandbox", False))
         sandbox_on = 0 if bypass else 1
-        auth_match = re.search(
-            r"#\s*auth:\s*(.+?)(?=\s+#\s*purpose:|$)", cmd, flags=re.IGNORECASE
-        )
-        purpose_match = re.search(
-            r"#\s*purpose:\s*(.+?)(?=\s+#\s*auth:|$)", cmd, flags=re.IGNORECASE
-        )
+        annotations = _parse_review_annotations(cmd)
         code_only = strip_commit_message_literals(strip_purpose_comment(cmd))
         ext_paths = _extract_command_ext_paths(code_only, cwd=cwd)
         outside_paths = [
@@ -1512,33 +1672,47 @@ def build_requested_action(
             "isDestructiveOrDelete": is_destructive_or_delete,
         }
         ssh_info = _parse_ssh_invocation(code_only)
+        local_cfg = load_local_config()
+        known_hosts = {
+            str(h).strip().lower()
+            for h in local_cfg.get("known_ssh_hosts", [])
+            if str(h).strip()
+        }
+        hpc_hosts = {
+            str(h).strip().lower()
+            for h in local_cfg.get("shared_hpc_hosts", [])
+            if str(h).strip()
+        }
         if ssh_info is not None:
             ssh_host = ssh_info[0]
             details["sshHost"] = ssh_host
-            local_cfg = load_local_config()
-            known_hosts = {
-                str(h).strip().lower()
-                for h in local_cfg.get("known_ssh_hosts", [])
-                if str(h).strip()
-            }
-            hpc_hosts = {
-                str(h).strip().lower()
-                for h in local_cfg.get("shared_hpc_hosts", [])
-                if str(h).strip()
-            }
             if ssh_host in hpc_hosts:
                 details["sharedHpcHost"] = True
                 details["knownUserSshHost"] = True
             elif ssh_host in known_hosts:
                 details["knownUserSshHost"] = True
+        else:
+            transfer_hosts = _extract_remote_transfer_hosts(code_only)
+            if transfer_hosts:
+                details["remoteHosts"] = transfer_hosts
+                if len(transfer_hosts) == 1:
+                    details["sshHost"] = transfer_hosts[0]
+                if any(h in hpc_hosts for h in transfer_hosts):
+                    details["sharedHpcHost"] = True
+                if all(h in (known_hosts | hpc_hosts) for h in transfer_hosts):
+                    details["knownUserSshHost"] = True
         if active_grants:
             details["activeVerbalGrants"] = active_grants[-6:]
-        if purpose_match:
-            details["purposeComment"] = purpose_match.group(1).strip()
-        if auth_match:
-            all_entries = list((ledger or {}).get("all_user_entries") or [])
+        if annotations["purpose"]:
+            details["purposeComment"] = annotations["purpose"]
+        if annotations["auth"]:
+            all_entries = list(
+                (ledger or {}).get("all_user_entries_with_context")
+                or (ledger or {}).get("all_user_entries")
+                or []
+            )
             details["citedUserAuth"] = verify_cited_user_authorization(
-                auth_match.group(1).strip(), all_entries
+                annotations["auth"], all_entries
             )
         return {
             "kind": "shell",
@@ -1584,8 +1758,11 @@ def evaluate_tool_call(
     artifact_dir = str(payload.get("artifactDirectoryPath") or payload.get("artifact_directory_path") or "")
     conversation_id = str(payload.get("conversationId") or payload.get("conversation_id") or "default")
     transcript_str = str(payload.get("transcriptPath") or payload.get("transcript_path") or "")
-    if not artifact_dir and "/.system_generated/" in transcript_str:
-        artifact_dir = transcript_str.split("/.system_generated/", 1)[0]
+    if not artifact_dir:
+        for sep_marker in ("/.system_generated/", "\\.system_generated\\"):
+            if sep_marker in transcript_str:
+                artifact_dir = transcript_str.split(sep_marker, 1)[0]
+                break
     transcript_path = Path(transcript_str) if transcript_str else None
     last_user_input = str(payload.get("lastUserInput", ""))
 
@@ -1605,6 +1782,18 @@ def evaluate_tool_call(
                 }
             else:
                 req_key = compute_request_key(conversation_id, tool_name, tool_args)
+                annotations = (
+                    _parse_review_annotations(str(tool_args.get("CommandLine", "")))
+                    if tool_name == "run_command"
+                    else {"auth": "", "purpose": "", "appeal_requested": False}
+                )
+                appeal_requested = bool(annotations["appeal_requested"])
+                is_destructive_cmd = False
+                if tool_name == "run_command":
+                    sanitized_for_dest = strip_commit_message_literals(
+                        strip_purpose_comment(str(tool_args.get("CommandLine", "")))
+                    )
+                    is_destructive_cmd = bool(DESTRUCTIVE_SCOPE_COMMAND_RE.search(sanitized_for_dest))
                 is_file_tool = tool_name in (
                     "read_file",
                     "write_file",
@@ -1655,14 +1844,14 @@ def evaluate_tool_call(
                                 p for p in ext_p if not is_safe_scoped_path(p, norm_ws, artifact_dir)
                             ]
 
-                cached = get_cached_verdict(conversation_id, req_key)
-                if cached is None and dir_sig is not None:
+                cached = None if appeal_requested else get_cached_verdict(conversation_id, req_key)
+                if not appeal_requested and cached is None and dir_sig is not None:
                     sig_cached = get_cached_verdict(conversation_id, dir_sig)
                     if sig_cached is not None and sig_cached.get("effect") == "allow":
                         cached = sig_cached
                 if cached is not None:
                     cached = {**cached, "source": "cache", "model": "session_cache"}
-                if cached is None and is_file_tool:
+                if not appeal_requested and cached is None and is_file_tool:
                     raw_p = str(
                         tool_args.get("Path")
                         or tool_args.get("TargetFile")
@@ -1681,7 +1870,7 @@ def evaluate_tool_call(
                                     "reason": f"File operation ({file_mode}) targets a repository/directory already approved in this session.",
                                 }
                                 break
-                if cached is None and cmd_outside_dirs:
+                if not appeal_requested and cached is None and cmd_outside_dirs:
                     # Check if every referenced external path (or an ancestor up to 4 levels) has an approved dir_grant
                     all_dirs_approved = True
                     for op in cmd_outside_dirs:
@@ -1701,7 +1890,8 @@ def evaluate_tool_call(
                             "reason": f"Routine command ({cmd_dir_mode}) targets an external directory already approved in this session.",
                         }
                 if (
-                    cached is None
+                    not appeal_requested
+                    and cached is None
                     and ssh_info is not None
                     and ssh_info[1]
                     and _is_strictly_readonly_remote_cmd(ssh_info[1])
@@ -1719,6 +1909,12 @@ def evaluate_tool_call(
                         }
                 if cached is not None:
                     verdict = cached
+                    res = apply_unresolved_send_back(
+                        conversation_id=conversation_id,
+                        verdict=verdict,
+                        unresolved_mode=os.environ.get("AGY_UNRESOLVED_MODE", "agent"),
+                        max_send_backs=int(os.environ.get("AGY_MAX_SEND_BACKS", str(DEFAULT_MAX_SEND_BACKS))),
+                    )
                 else:
                     requested_action = build_requested_action(
                         tool_name,
@@ -1728,26 +1924,27 @@ def evaluate_tool_call(
                         artifact_dir=artifact_dir,
                         ledger=ledger,
                     )
-                    compact_tx = extract_compact_transcript(
-                        transcript_path,
-                        max_items=10,
-                        max_chars=2000,
-                        include_thinking=False,
+                    local_cfg = load_local_config()
+                    decision_models = _resolve_model_list(
+                        "AGY_DECISION_MODELS",
+                        local_cfg,
+                        "decision_models",
+                        DEFAULT_DECISION_MODELS,
                     )
-                    decision_models = [
-                        m.strip()
-                        for m in os.environ.get(
-                            "AGY_DECISION_MODELS", ",".join(DEFAULT_DECISION_MODELS)
-                        ).split(",")
-                        if m.strip()
-                    ]
-                    escalation_models = [
-                        m.strip()
-                        for m in os.environ.get(
-                            "AGY_ESCALATION_MODELS", ",".join(DEFAULT_ESCALATION_MODELS)
-                        ).split(",")
-                        if m.strip()
-                    ]
+                    escalation_models = _resolve_model_list(
+                        "AGY_ESCALATION_MODELS",
+                        local_cfg,
+                        "escalation_models",
+                        DEFAULT_ESCALATION_MODELS,
+                        append_fallbacks=DEFAULT_ESCALATION_MODELS,
+                    )
+                    deep_models = _resolve_model_list(
+                        "AGY_DEEP_REVIEW_MODELS",
+                        local_cfg,
+                        "deep_review_models",
+                        escalation_models,
+                        append_fallbacks=escalation_models,
+                    )
                     paid_models = [
                         m.strip()
                         for m in os.environ.get(
@@ -1764,100 +1961,214 @@ def evaluate_tool_call(
                     escalation_timeout = float(
                         os.environ.get("AGY_ESCALATION_TIMEOUT_SEC", str(DEFAULT_ESCALATION_TIMEOUT_SEC))
                     )
-                    kwargs = {"api_caller": api_caller} if api_caller is not None else {}
-                    first = run_jev_decision_tier(
-                        models=decision_models,
-                        min_confidence=min_conf,
-                        user_messages=ledger.get("recent_user_messages", []),
-                        compact_transcript=compact_tx,
-                        requested_action=requested_action,
-                        timeout_sec=decision_timeout,
-                        **kwargs,
+                    deep_timeout = float(
+                        os.environ.get("AGY_DEEP_REVIEW_TIMEOUT_SEC", str(DEFAULT_DEEP_REVIEW_TIMEOUT_SEC))
                     )
-                    if first.get("effect") == "ask" and escalation_models:
-                        esc_tx = extract_compact_transcript(
+                    kwargs = {"api_caller": api_caller} if api_caller is not None else {}
+
+                    def _find_relevant_earlier() -> list[str]:
+                        query_text = " ".join(
+                            [
+                                str(tool_args.get("CommandLine", "")),
+                                *(str(t) for t in (requested_action.get("targets") or [])),
+                                *(str(p) for p in ((requested_action.get("details") or {}).get("externalPaths") or [])),
+                            ]
+                        )
+                        return extract_relevant_earlier_user_turns(
+                            query_text,
+                            ledger.get("all_user_entries_with_context") or [],
+                            exclude_step_indices=ledger.get("active_user_step_indices") or [],
+                        )
+
+                    if appeal_requested:
+                        last_user_step = int(ledger.get("last_user_step_index", 0))
+                        latest_step = max(
+                            int(payload.get("stepIdx") or 0),
+                            int(ledger.get("latest_step_index", 0)),
+                        )
+                        recent_steps_limit = int(os.environ.get("AGY_APPEAL_RECENT_STEPS", "12"))
+                        has_user_entries = bool(ledger.get("all_user_entries"))
+                        is_recent_user = has_user_entries and (latest_step - last_user_step) <= recent_steps_limit
+                        cited_auth = (requested_action.get("details") or {}).get("citedUserAuth") or {}
+                        cited_verified = cited_auth.get("verifiedFromTranscript") is True
+                        if cited_auth.get("verifiedFromTranscript") is False or not (is_recent_user or cited_verified):
+                            res = {
+                                "decision": "deny",
+                                "reason": (
+                                    "Auto Permissions rejected # appeal: deep review requires either a recent user "
+                                    "authorization turn or a transcript-verified `# auth: \"<exact phrase>\"` / `# auth: step <N>` citation."
+                                ),
+                                "tier": "appeal_gate_rejected",
+                            }
+                        else:
+                            code_only_fp = strip_commit_message_literals(
+                                strip_purpose_comment(str(tool_args.get("CommandLine", "")))
+                            )
+                            cmd_fp = hashlib.sha256(code_only_fp.encode("utf-8")).hexdigest()[:24]
+                            max_appeals = int(os.environ.get("AGY_MAX_APPEALS_PER_TURN", "4"))
+                            allowed_quota, quota_reason = check_and_record_appeal_quota(
+                                conversation_id,
+                                last_user_step,
+                                cmd_fp,
+                                max_per_turn=max_appeals,
+                            )
+                            if not allowed_quota:
+                                res = {
+                                    "decision": "deny",
+                                    "reason": f"Auto Permissions rejected # appeal: {quota_reason}",
+                                    "tier": "appeal_limit_exceeded",
+                                }
+                            else:
+                                deep_tx = extract_compact_transcript(
+                                    transcript_path,
+                                    max_items=22,
+                                    max_chars=5500,
+                                    include_thinking=False,
+                                    user_limit=1400,
+                                    agent_limit=1200,
+                                    tool_limit=360,
+                                )
+                                second = run_escalation_tier(
+                                    escalation_models=deep_models,
+                                    requested_action=requested_action,
+                                    first_verdict={"reason": "agent requested deep/appeal review"},
+                                    compact_transcript=deep_tx,
+                                    timeout_sec=deep_timeout,
+                                    appeal_mode=True,
+                                    relevant_earlier_turns=_find_relevant_earlier(),
+                                    **kwargs,
+                                )
+                                verdict = (
+                                    second
+                                    if second is not None
+                                    else {
+                                        "effect": "ask",
+                                        "source": "model",
+                                        "reasonCode": "appeal_failed",
+                                        "reason": "deep review models unavailable or timed out",
+                                    }
+                                )
+                                if verdict.get("effect") == "ask":
+                                    res = {
+                                        "decision": "deny",
+                                        "reason": (
+                                            f"Auto Permissions deep review could not approve this action ({verdict.get('reason', '')}). "
+                                            "Stop and confirm with the user in plain chat text rather than retrying."
+                                        ),
+                                        "tier": verdict.get("model") or verdict.get("reasonCode", "appeal_unsure"),
+                                    }
+                                else:
+                                    res = apply_unresolved_send_back(
+                                        conversation_id=conversation_id,
+                                        verdict=verdict,
+                                        unresolved_mode=os.environ.get("AGY_UNRESOLVED_MODE", "agent"),
+                                        max_send_backs=int(os.environ.get("AGY_MAX_SEND_BACKS", str(DEFAULT_MAX_SEND_BACKS))),
+                                    )
+                    else:
+                        compact_tx = extract_compact_transcript(
                             transcript_path,
-                            max_items=18,
-                            max_chars=4200,
+                            max_items=10,
+                            max_chars=2000,
                             include_thinking=False,
                         )
-                        second = run_escalation_tier(
-                            escalation_models=escalation_models,
+                        first = run_jev_decision_tier(
+                            models=decision_models,
+                            min_confidence=min_conf,
+                            user_messages=ledger.get("recent_user_messages", []),
+                            compact_transcript=compact_tx,
                             requested_action=requested_action,
-                            first_verdict=first,
-                            compact_transcript=esc_tx or compact_tx,
-                            timeout_sec=escalation_timeout,
+                            timeout_sec=decision_timeout,
                             **kwargs,
                         )
-                        if second is not None:
-                            verdict = second
-                        elif (
-                            first.get("reasonCode") == "review_failed"
-                            and "opencode binary not found" not in str(first.get("reason", ""))
-                            and paid_models
-                        ):
-                            paid_tx = extract_compact_transcript(
+                        if first.get("effect") == "ask" and escalation_models:
+                            esc_tx = extract_compact_transcript(
                                 transcript_path,
-                                max_items=6,
-                                max_chars=1000,
+                                max_items=20,
+                                max_chars=5000,
                                 include_thinking=False,
+                                user_limit=1200,
+                                agent_limit=900,
+                                tool_limit=360,
                             )
-                            verdict = run_jev_decision_tier(
-                                models=paid_models,
-                                min_confidence=min_conf,
-                                user_messages=ledger.get("recent_user_messages", [])[-2:],
-                                compact_transcript=paid_tx,
+                            second = run_escalation_tier(
+                                escalation_models=escalation_models,
                                 requested_action=requested_action,
-                                timeout_sec=decision_timeout,
+                                first_verdict=first,
+                                compact_transcript=esc_tx or compact_tx,
+                                timeout_sec=escalation_timeout,
+                                relevant_earlier_turns=_find_relevant_earlier(),
                                 **kwargs,
                             )
+                            if second is not None:
+                                verdict = second
+                            elif (
+                                first.get("reasonCode") == "review_failed"
+                                and "opencode binary not found" not in str(first.get("reason", ""))
+                                and paid_models
+                            ):
+                                paid_tx = extract_compact_transcript(
+                                    transcript_path,
+                                    max_items=6,
+                                    max_chars=1000,
+                                    include_thinking=False,
+                                )
+                                verdict = run_jev_decision_tier(
+                                    models=paid_models,
+                                    min_confidence=min_conf,
+                                    user_messages=ledger.get("recent_user_messages", [])[-2:],
+                                    compact_transcript=paid_tx,
+                                    requested_action=requested_action,
+                                    timeout_sec=decision_timeout,
+                                    **kwargs,
+                                )
+                            else:
+                                verdict = first
                         else:
                             verdict = first
-                    else:
-                        verdict = first
-                    put_cached_verdict(conversation_id, req_key, verdict)
 
-                if verdict.get("effect") == "allow":
-                    if dir_sig is not None:
-                        put_cached_verdict(conversation_id, dir_sig, verdict)
-                    if cached is None:
-                        if is_file_tool:
-                            raw_p = str(
-                                tool_args.get("Path")
-                                or tool_args.get("TargetFile")
-                                or tool_args.get("AbsolutePath")
-                                or ""
-                            )
-                            if raw_p:
-                                norm_p = normalize_path(raw_p, cwd=cwd)
-                                for cd in _dir_grant_candidates(norm_p, include_self=False, max_levels=2):
+                        if not is_destructive_cmd:
+                            put_cached_verdict(conversation_id, req_key, verdict)
+
+                        if verdict.get("effect") == "allow":
+                            if dir_sig is not None:
+                                put_cached_verdict(conversation_id, dir_sig, verdict)
+                            if is_file_tool:
+                                raw_p = str(
+                                    tool_args.get("Path")
+                                    or tool_args.get("TargetFile")
+                                    or tool_args.get("AbsolutePath")
+                                    or ""
+                                )
+                                if raw_p:
+                                    norm_p = normalize_path(raw_p, cwd=cwd)
+                                    for cd in _dir_grant_candidates(norm_p, include_self=False, max_levels=2):
+                                        put_cached_verdict(
+                                            conversation_id,
+                                            compute_directory_grant_key(cd, file_mode),
+                                            verdict,
+                                        )
+                            for op in cmd_outside_dirs:
+                                for cd in _dir_grant_candidates(op, include_self=True, max_levels=1):
                                     put_cached_verdict(
                                         conversation_id,
-                                        compute_directory_grant_key(cd, file_mode),
+                                        compute_directory_grant_key(cd, cmd_dir_mode),
                                         verdict,
                                     )
-                        for op in cmd_outside_dirs:
-                            for cd in _dir_grant_candidates(op, include_self=True, max_levels=1):
+                            if ssh_info is not None:
                                 put_cached_verdict(
                                     conversation_id,
-                                    compute_directory_grant_key(cd, cmd_dir_mode),
+                                    compute_ssh_host_grant_key(ssh_info[0]),
                                     verdict,
                                 )
-                        if ssh_info is not None:
-                            put_cached_verdict(
-                                conversation_id,
-                                compute_ssh_host_grant_key(ssh_info[0]),
-                                verdict,
-                            )
 
-                unresolved_mode = os.environ.get("AGY_UNRESOLVED_MODE", "agent")
-                max_sb = int(os.environ.get("AGY_MAX_SEND_BACKS", str(DEFAULT_MAX_SEND_BACKS)))
-                res = apply_unresolved_send_back(
-                    conversation_id=conversation_id,
-                    verdict=verdict,
-                    unresolved_mode=unresolved_mode,
-                    max_send_backs=max_sb,
-                )
+                        unresolved_mode = os.environ.get("AGY_UNRESOLVED_MODE", "agent")
+                        max_sb = int(os.environ.get("AGY_MAX_SEND_BACKS", str(DEFAULT_MAX_SEND_BACKS)))
+                        res = apply_unresolved_send_back(
+                            conversation_id=conversation_id,
+                            verdict=verdict,
+                            unresolved_mode=unresolved_mode,
+                            max_send_backs=max_sb,
+                        )
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     target_summary = ""
@@ -1996,9 +2307,29 @@ def build_reviewer_status(args: dict[str, Any] | None = None) -> dict[str, Any]:
         "recent_user_messages": ledger.get("recent_user_messages", []),
         "total_user_messages_in_transcript": len(ledger.get("all_user_entries", [])),
     }
+    local_cfg = load_local_config()
+    decision_models = _resolve_model_list(
+        "AGY_DECISION_MODELS", local_cfg, "decision_models", DEFAULT_DECISION_MODELS
+    )
+    escalation_models = _resolve_model_list(
+        "AGY_ESCALATION_MODELS",
+        local_cfg,
+        "escalation_models",
+        DEFAULT_ESCALATION_MODELS,
+        append_fallbacks=DEFAULT_ESCALATION_MODELS,
+    )
+    deep_models = _resolve_model_list(
+        "AGY_DEEP_REVIEW_MODELS",
+        local_cfg,
+        "deep_review_models",
+        escalation_models,
+        append_fallbacks=escalation_models,
+    )
     return {
         "mode": os.environ.get("AGY_REVIEWER_MODE", "opencode"),
-        "model": os.environ.get("AGY_DECISION_MODELS", "opencode/jev-1.13-free"),
+        "model": ",".join(decision_models) if decision_models else "disabled",
+        "escalation_models": escalation_models,
+        "deep_review_models": deep_models,
         "opencode_available": find_opencode_binary() is not None,
         "session_tier_breakdown": tier_counts,
         "session_decision_breakdown": decision_counts,
@@ -2010,6 +2341,12 @@ def build_reviewer_status(args: dict[str, Any] | None = None) -> dict[str, Any]:
 
 def main() -> int:
     try:
+        for stream in (sys.stdin, sys.stdout):
+            if hasattr(stream, "reconfigure"):
+                try:
+                    stream.reconfigure(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
         raw = sys.stdin.read().strip()
         payload = json.loads(raw) if raw else {}
         res = evaluate_tool_call(payload)

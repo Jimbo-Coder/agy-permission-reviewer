@@ -9,5 +9,6 @@
     "cluster-login"
   ],
   "extra_read_only_paths": [],
-  "extra_denied_paths": []
+  "extra_denied_paths": [],
+  "deep_review_models": []
 }

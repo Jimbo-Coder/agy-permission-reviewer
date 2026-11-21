@@ -18,15 +18,16 @@ Naive auto-reviewers feed the entire 50k–200k token conversation transcript to
 
 2. **Layer 2 — Context-Anchored OpenCode Reviewer Cascade + 3-Strike Agent Send-Back**:
    - First pass: `opencode/jev-1.13-free` via `opencode api experimental.generate.decisions` (`minConfidence = 0.80`, `3.5s` timeout, \$0, ~220 ms).
-   - Incrementally indexes `USER_INPUT` turns in `transcript.jsonl` to pair brief affirmative replies (`"yes"`, `"go ahead"`) with the preceding agent question tail cleanly without letting agent output self-grant permissions, and keeps the brittle English-prose regex grant ledger (`AGY_ENABLE_PROSE_LEDGER=0`) disabled by default.
-   - Second-opinion escalation: `opencode-go/beam-free` → `opencode-go/longcat-2.5-free` via `opencode api experimental.generate.text` (`5.0s` cap with `60s` backoff on timeout/errors, \$0).
+   - Incrementally indexes `USER_INPUT` and `PLANNER_RESPONSE` turns in `transcript.jsonl` to pair affirmative or explicit-permission replies with the preceding agent proposal tail without letting agent output self-grant permissions, preserves the preceding proposal across turn boundaries, extracts `knownUserSshHost` / `sharedHpcHost` metadata for `ssh`/`scp`/`sftp`/`rsync`, never caches `deny` verdicts across user turns, and keeps the brittle English-prose regex grant ledger (`AGY_ENABLE_PROSE_LEDGER=0`) disabled by default.
+   - Second-opinion escalation: `opencode-go/beam-free` → `opencode-go/longcat-2.5-free` via `opencode api experimental.generate.text` (`9.0s` cap with `20s` timeout cooldown / `60s` HTTP error backoff, \$0), using expanded proposal context, zero-token auto-retrieval of relevant earlier user turns, and reasoning-first JSON verdicts.
+   - Opt-in `# appeal` / `# review: deep` (`AGY_DEEP_REVIEW_MODELS` or local `"deep_review_models"`, `AGY_DEEP_REVIEW_TIMEOUT_SEC`, default `11.0s`): lets an agent route a sensitive one-time user-authorized command directly to the deeper reviewer under deterministic guardrails (Tier 0 hard-denies remain non-appealable, requires a recent `USER_INPUT` or transcript-verified `# auth:`, capped to 1 appeal per command and 4 per turn, and never cached or promoted into session directory/SSH caches).
    - Paid failover: `opencode/jev-1.13` (`3.5s` timeout, ultra-compact transcript) runs only when `jev-1.13-free` errored/timed out/rate-limited (`120s` backoff) **and** free escalation also failed/timed out.
-   - Deterministic `# auth: "<exact user phrase>"` (or `# auth: step <N>`) verification against `transcript.jsonl` so earlier user authorizations can be cited without widening the prompt window (unverified quotes are flagged as fake).
-   - 3-strike agent send-back: ambiguous or broad commands are returned to the agent with actionable instructions to narrow scope, split chained commands, or add a `# purpose:` / `# auth:` comment before troubling the user.
+   - Deterministic `# auth: "<exact user phrase>"` (or `# auth: step <N>`) verification against `transcript.jsonl` (enriched with the preceding agent proposal when present) so earlier user authorizations can be cited without widening the prompt window (unverified quotes are flagged as fake).
+   - 3-strike agent send-back: ambiguous or broad commands are returned to the agent with actionable instructions to narrow scope, split chained commands, add a `# purpose:` / `# auth:` comment, or use `# appeal` once if explicitly authorized before troubling the user.
 
 ## Optional Local Policy Configuration
 
-User-specific repository or path rules can be configured in `~/.gemini/config/permission_reviewer.local.json` (or via `AGY_PERMISSION_REVIEWER_LOCAL_CONFIG`) without modifying tracked plugin files. See [permission_reviewer.local.example.json](permission_reviewer.local.example.json):
+User-specific repository, path, or bring-your-own-model rules can be configured in `~/.gemini/config/permission_reviewer.local.json` (or via `AGY_PERMISSION_REVIEWER_LOCAL_CONFIG`) without modifying tracked plugin files. See [permission_reviewer.local.example.json](permission_reviewer.local.example.json):
 
 ```json
 {
@@ -40,14 +41,25 @@ User-specific repository or path rules can be configured in `~/.gemini/config/pe
     "cluster-login"
   ],
   "extra_read_only_paths": [],
-  "extra_denied_paths": []
+  "extra_denied_paths": [],
+  "deep_review_models": []
 }
 ```
 
+**Bring Your Own Models:** Everything works `$0` out of the box using free models. If you have an OpenCode Go subscription or other configured OpenCode providers, you can set `"deep_review_models"` (for example `["opencode-go/claude-haiku-5-5", "opencode-go/gpt-5.6-luna"]`, plus optional `"escalation_models"` / `"decision_models"`) in your local config. Free fallbacks (`beam-free`, `longcat-2.5-free`) are automatically appended, and expired/unauthorized/missing models (`401`/`402`/`403`/`404`/subscription/quota errors) enter a `1h` backoff so the pipeline degrades gracefully back to free models without breaking.
+
 ## Installation
 
+Supports macOS, Linux, and Windows (via the polyglot `scripts/run_hook.cmd` hook launcher and automatic native `opencode.exe` resolution):
+
 ```bash
+# macOS / Linux
 git clone https://github.com/Jimbo-Coder/agy-permission-reviewer ~/.gemini/config/plugins/agy-permission-reviewer
+```
+
+```powershell
+# Windows (PowerShell)
+git clone https://github.com/Jimbo-Coder/agy-permission-reviewer "$env:USERPROFILE\.gemini\config\plugins\agy-permission-reviewer"
 ```
 
 Companion plugin: [agy-context-guard](https://github.com/Jimbo-Coder/agy-context-guard) (context window monitor and self-triggered compaction).
