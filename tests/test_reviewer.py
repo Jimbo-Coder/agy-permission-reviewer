@@ -22,8 +22,17 @@ class TestPermissionReviewer(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.tmp_path = Path(self.tmp.name)
+        for key in ("PLUGIN_DATA", "AGY_REVIEWER_MODE", "AGY_PERMISSION_REVIEWER_LOCAL_CONFIG", "GEMINI_HOME"):
+            prev = review_hook.os.environ.get(key)
+            self.addCleanup(
+                lambda k=key, v=prev: review_hook.os.environ.pop(k, None)
+                if v is None
+                else review_hook.os.environ.__setitem__(k, v)
+            )
         review_hook.os.environ["PLUGIN_DATA"] = str(self.tmp_path / "plugin_data")
         review_hook.os.environ["AGY_REVIEWER_MODE"] = "ledger_only"
+        review_hook.os.environ["AGY_PERMISSION_REVIEWER_LOCAL_CONFIG"] = str(self.tmp_path / "no_local_config.json")
+        review_hook.os.environ.pop("GEMINI_HOME", None)
 
     def _write_transcript(self, user_inputs: list[str]) -> Path:
         tp = self.tmp_path / "transcript.jsonl"
@@ -1822,7 +1831,11 @@ class TestPermissionReviewer(unittest.TestCase):
         self.assertIn("other-custom-hook", data)
         self.assertIn("context-permission-reviewer", data)
         installed_cmd = data["context-permission-reviewer"]["PreToolUse"][0]["hooks"][0]["command"]
-        self.assertEqual(len(shlex.split(installed_cmd, posix=True)), 2)
+        installed_parts = shlex.split(installed_cmd, posix=True)
+        self.assertEqual(len(installed_parts), 4 if os.name == "nt" else 2)
+        if os.name == "nt":
+            self.assertEqual(installed_parts[1:3], ["-X", "utf8"])
+        self.assertTrue(installed_parts[-1].endswith("review_hook.py"))
 
         self.assertTrue(install_t3code.uninstall_from_profile(prof))
         data_after = json.loads(hooks_path.read_text(encoding="utf-8"))

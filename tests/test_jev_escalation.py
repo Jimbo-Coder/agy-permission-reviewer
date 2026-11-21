@@ -24,8 +24,17 @@ class TestJevEscalationAndSendBack(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.tmp_path = Path(self.tmp.name)
+        for key in ("PLUGIN_DATA", "AGY_REVIEWER_MODE", "AGY_PERMISSION_REVIEWER_LOCAL_CONFIG", "GEMINI_HOME"):
+            prev = review_hook.os.environ.get(key)
+            self.addCleanup(
+                lambda k=key, v=prev: review_hook.os.environ.pop(k, None)
+                if v is None
+                else review_hook.os.environ.__setitem__(k, v)
+            )
         review_hook.os.environ["PLUGIN_DATA"] = str(self.tmp_path / "plugin_data")
         review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        review_hook.os.environ["AGY_PERMISSION_REVIEWER_LOCAL_CONFIG"] = str(self.tmp_path / "no_local_config.json")
+        review_hook.os.environ.pop("GEMINI_HOME", None)
 
     def _write_transcript(self, user_inputs: list[str]) -> Path:
         tp = self.tmp_path / "transcript.jsonl"
