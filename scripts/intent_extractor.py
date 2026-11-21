@@ -8,6 +8,7 @@ Distinguishes read-only vs read-write grants and honors negative prohibitions.
 
 from __future__ import annotations
 
+from datetime import datetime
 import functools
 import hashlib
 import json
@@ -15,7 +16,9 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sqlite3
 import tempfile
+import time
 from typing import Any
 
 USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.DOTALL)
@@ -170,10 +173,8 @@ def _ledger_cache_file(transcript_path: Path) -> Path:
     return cache_dir / f"{digest}.json"
 
 
-from datetime import datetime
-
 METADATA_TIME_RE = re.compile(r"The current local time is:\s*([0-9T:\-+Z.]+)")
-LEDGER_CACHE_VERSION = 3
+LEDGER_CACHE_VERSION = 4
 SHORT_AFFIRMATION_RE = re.compile(
     r"^(?:yes|yep|yeah|yup|sure|ok|okay|proceed|continue|keep going|go on|go ahead|do it|sounds good|lgtm|approved|i'?ve allowed|already allowed)\b",
     re.IGNORECASE,
@@ -296,20 +297,237 @@ def select_active_user_messages(
     return out
 
 
+def _read_pb_varint(buf: bytes, pos: int) -> tuple[int, int] | None:
+    val = 0
+    shift = 0
+    n = len(buf)
+    while pos < n and shift < 70:
+        b = buf[pos]
+        pos += 1
+        val |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return val, pos
+        shift += 7
+    return None
+
+
+def _iter_pb_fields(buf: bytes):
+    """Yield `(field_number, wire_type, value)` pairs from raw protobuf wire bytes."""
+    pos = 0
+    n = len(buf)
+    while pos < n:
+        tag_res = _read_pb_varint(buf, pos)
+        if tag_res is None:
+            return
+        tag, pos = tag_res
+        field_num = tag >> 3
+        wire_type = tag & 0x7
+        if field_num <= 0:
+            return
+        if wire_type == 0:
+            val_res = _read_pb_varint(buf, pos)
+            if val_res is None:
+                return
+            val, pos = val_res
+            yield field_num, wire_type, val
+        elif wire_type == 1:
+            if pos + 8 > n:
+                return
+            yield field_num, wire_type, buf[pos : pos + 8]
+            pos += 8
+        elif wire_type == 2:
+            len_res = _read_pb_varint(buf, pos)
+            if len_res is None:
+                return
+            length, pos = len_res
+            if length < 0 or pos + length > n:
+                return
+            yield field_num, wire_type, buf[pos : pos + length]
+            pos += length
+        elif wire_type == 5:
+            if pos + 4 > n:
+                return
+            yield field_num, wire_type, buf[pos : pos + 4]
+            pos += 4
+        else:
+            return
+
+
+def _pb_str(raw: Any) -> str:
+    return bytes(raw).decode("utf-8", errors="replace").strip() if isinstance(raw, (bytes, bytearray, memoryview)) else ""
+
+
+def _extract_acp_step_timestamp(meta_bytes: bytes | None) -> str:
+    if not meta_bytes:
+        return ""
+    for m_num, m_wt, m_val in _iter_pb_fields(meta_bytes):
+        if m_num == 1 and m_wt == 2:
+            for t_num, t_wt, t_val in _iter_pb_fields(m_val):
+                if t_num == 1 and t_wt == 0 and 0 < int(t_val) < 10_000_000_000:
+                    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(t_val)))
+    return ""
+
+
+def _decode_acp_step_row(idx: int, step_type: int, payload: bytes) -> dict[str, Any] | None:
+    """Decode a CortexStep protobuf payload row from an ACP SQLite conversation database."""
+    meta_bytes: bytes | None = None
+    user_bytes: bytes | None = None
+    planner_bytes: bytes | None = None
+    for fnum, wt, val in _iter_pb_fields(payload):
+        if wt != 2:
+            continue
+        if fnum == 5 and meta_bytes is None:
+            meta_bytes = val
+        elif fnum == 19 and user_bytes is None:
+            user_bytes = val
+        elif fnum == 20 and planner_bytes is None:
+            planner_bytes = val
+
+    created_at = _extract_acp_step_timestamp(meta_bytes)
+
+    if step_type == 14 or user_bytes is not None:
+        user_response = ""
+        item_texts: list[str] = []
+        if user_bytes is not None:
+            for u_num, u_wt, u_val in _iter_pb_fields(user_bytes):
+                if u_num == 2 and u_wt == 2:
+                    user_response = _pb_str(u_val)
+                elif u_num == 3 and u_wt == 2:
+                    for i_num, i_wt, i_val in _iter_pb_fields(u_val):
+                        if i_num == 1 and i_wt == 2:
+                            t = _pb_str(i_val)
+                            if t:
+                                item_texts.append(t)
+        text = user_response or "\n".join(item_texts).strip()
+        if not text:
+            return None
+        return {
+            "step_index": int(idx),
+            "type": "USER_INPUT",
+            "created_at": created_at,
+            "content": text,
+        }
+
+    if step_type == 15 or planner_bytes is not None:
+        response = ""
+        modified_response = ""
+        thinking = ""
+        if planner_bytes is not None:
+            for p_num, p_wt, p_val in _iter_pb_fields(planner_bytes):
+                if p_wt != 2:
+                    continue
+                if p_num == 1:
+                    response = _pb_str(p_val)
+                elif p_num == 8:
+                    modified_response = _pb_str(p_val)
+                elif p_num == 3:
+                    thinking = _pb_str(p_val)
+        text = modified_response or response
+        return {
+            "step_index": int(idx),
+            "type": "PLANNER_RESPONSE",
+            "created_at": created_at,
+            "content": text,
+            "thinking": thinking,
+        }
+
+    if step_type == 23:
+        return {
+            "step_index": int(idx),
+            "type": "CHECKPOINT",
+            "created_at": created_at,
+            "content": "",
+        }
+
+    return None
+
+
+def read_acp_sqlite_steps(
+    db_path: Path,
+    *,
+    after_idx: int = -1,
+    tail_limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Read normalized trajectory steps from an Antigravity ACP SQLite `.db` file (read-only)."""
+    if not db_path.is_file():
+        return []
+    conn: sqlite3.Connection | None = None
+    try:
+        db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, timeout=0.2)
+        conn.execute("PRAGMA busy_timeout = 100")
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'"
+        ).fetchone()
+        if has_table is None:
+            return []
+        if tail_limit is not None:
+            rows = conn.execute(
+                "SELECT idx, step_type, step_payload FROM steps ORDER BY idx DESC LIMIT ?",
+                (int(tail_limit),),
+            ).fetchall()
+            rows.reverse()
+        else:
+            rows = conn.execute(
+                "SELECT idx, step_type, step_payload FROM steps WHERE idx > ? ORDER BY idx ASC",
+                (int(after_idx),),
+            ).fetchall()
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    steps: list[dict[str, Any]] = []
+    for idx, step_type, payload in rows:
+        if payload is None:
+            continue
+        decoded = _decode_acp_step_row(int(idx), int(step_type), bytes(payload))
+        if decoded is not None:
+            steps.append(decoded)
+    return steps
+
+
 def collect_session_ledger(
     transcript_path: Path | None,
     last_user_input: str = "",
     cwd: str = "",
 ) -> dict[str, Any]:
-    """Incrementally scan USER_INPUT, PLANNER_RESPONSE, and CHECKPOINT steps in transcript.jsonl."""
+    """Incrementally scan USER_INPUT, PLANNER_RESPONSE, and CHECKPOINT steps in transcript.jsonl or ACP `.db`."""
     user_messages: list[tuple[int, str, float | None, str]] = []
     checkpoint_summaries: list[str] = []
     last_agent_tail = ""
     latest_step_index = 0
+    last_db_idx = -1
+
+    def _ingest_step_obj(obj: dict[str, Any]) -> None:
+        nonlocal last_agent_tail, latest_step_index
+        step_type = str(obj.get("type", ""))
+        step_idx = int(obj.get("step_index", 0))
+        latest_step_index = max(latest_step_index, step_idx)
+        if step_type == "USER_INPUT":
+            clean = extract_clean_user_text(str(obj.get("content", "")))
+            if clean and not clean.startswith("Auto Permissions"):
+                user_messages.append(
+                    (step_idx, clean, _extract_step_timestamp(obj), last_agent_tail)
+                )
+        elif step_type == "PLANNER_RESPONSE":
+            agent_text = " ".join(str(obj.get("content", "")).split()).strip()
+            if agent_text:
+                last_agent_tail = agent_text[-800:]
+        elif "CHECKPOINT" in step_type:
+            cp_text = str(obj.get("content", "")).strip()
+            if cp_text:
+                checkpoint_summaries.append(cp_text[:2500])
+
     if transcript_path and transcript_path.is_file():
         try:
             st = transcript_path.stat()
             cache_file = _ledger_cache_file(transcript_path)
+            is_db = transcript_path.suffix.lower() == ".db"
             start_offset = 0
             if cache_file.is_file():
                 try:
@@ -317,9 +535,10 @@ def collect_session_ledger(
                     if (
                         int(cached.get("version", 1)) == LEDGER_CACHE_VERSION
                         and int(cached.get("inode", -1)) == st.st_ino
-                        and 0 <= int(cached.get("offset", 0)) <= st.st_size
+                        and (is_db or 0 <= int(cached.get("offset", 0)) <= st.st_size)
                     ):
-                        start_offset = int(cached["offset"])
+                        start_offset = int(cached.get("offset", 0))
+                        last_db_idx = int(cached.get("last_db_idx", -1))
                         last_agent_tail = str(cached.get("last_agent_tail", ""))
                         latest_step_index = int(cached.get("latest_step_index", 0))
                         user_messages = [
@@ -331,12 +550,21 @@ def collect_session_ledger(
                         ]
                 except Exception:
                     start_offset = 0
+                    last_db_idx = -1
                     last_agent_tail = ""
                     latest_step_index = 0
                     user_messages = []
                     checkpoint_summaries = []
 
-            if st.st_size > start_offset:
+            updated_cache = False
+            new_offset = start_offset
+            if is_db:
+                new_steps = read_acp_sqlite_steps(transcript_path, after_idx=last_db_idx)
+                for obj in new_steps:
+                    _ingest_step_obj(obj)
+                    last_db_idx = max(last_db_idx, int(obj.get("step_index", 0)))
+                    updated_cache = True
+            elif st.st_size > start_offset:
                 with transcript_path.open("rb") as fh:
                     fh.seek(start_offset)
                     chunk = fh.read()
@@ -359,24 +587,10 @@ def collect_session_ledger(
                         obj = json.loads(raw_line.decode("utf-8", errors="replace"))
                     except json.JSONDecodeError:
                         continue
-                    step_type = obj.get("type", "")
-                    step_idx = int(obj.get("step_index", 0))
-                    latest_step_index = max(latest_step_index, step_idx)
-                    if step_type == "USER_INPUT":
-                        clean = extract_clean_user_text(str(obj.get("content", "")))
-                        if clean and not clean.startswith("Auto Permissions"):
-                            user_messages.append(
-                                (step_idx, clean, _extract_step_timestamp(obj), last_agent_tail)
-                            )
-                    elif step_type == "PLANNER_RESPONSE":
-                        agent_text = " ".join(str(obj.get("content", "")).split()).strip()
-                        if agent_text:
-                            last_agent_tail = agent_text[-800:]
-                    elif "CHECKPOINT" in step_type:
-                        cp_text = str(obj.get("content", "")).strip()
-                        if cp_text:
-                            checkpoint_summaries.append(cp_text[:2500])
+                    _ingest_step_obj(obj)
+                updated_cache = True
 
+            if updated_cache:
                 try:
                     cache_file.write_text(
                         json.dumps(
@@ -384,6 +598,7 @@ def collect_session_ledger(
                                 "version": LEDGER_CACHE_VERSION,
                                 "inode": st.st_ino,
                                 "offset": new_offset,
+                                "last_db_idx": last_db_idx,
                                 "last_agent_tail": last_agent_tail,
                                 "latest_step_index": latest_step_index,
                                 "user_messages": user_messages,

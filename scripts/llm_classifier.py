@@ -197,20 +197,38 @@ def extract_compact_transcript(
     """Build compact recent conversation transcript (tight default for jev-1.13-free; expandable for escalation)."""
     if not transcript_path or not transcript_path.is_file():
         return ""
-    try:
-        size = transcript_path.stat().st_size
-        with transcript_path.open("rb") as fh:
-            if size > 262_144:
-                fh.seek(size - 262_144)
-                raw = fh.read()
-                nl = raw.find(b"\n")
-                if nl != -1:
-                    raw = raw[nl + 1 :]
-            else:
-                raw = fh.read()
-        lines_raw = raw.decode("utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
+
+    from intent_extractor import _extract_step_timestamp, read_acp_sqlite_steps
+
+    if transcript_path.suffix.lower() == ".db":
+        step_objs = read_acp_sqlite_steps(
+            transcript_path, tail_limit=max(60, max_items * 4)
+        )
+    else:
+        try:
+            size = transcript_path.stat().st_size
+            with transcript_path.open("rb") as fh:
+                if size > 262_144:
+                    fh.seek(size - 262_144)
+                    raw = fh.read()
+                    nl = raw.find(b"\n")
+                    if nl != -1:
+                        raw = raw[nl + 1 :]
+                else:
+                    raw = fh.read()
+            lines_raw = raw.decode("utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+        step_objs = []
+        for ln in lines_raw:
+            if not ln.strip():
+                continue
+            try:
+                obj = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                step_objs.append(obj)
 
     if user_limit is None:
         user_limit = 1200 if max_chars >= 4000 else 600
@@ -219,17 +237,9 @@ def extract_compact_transcript(
     if tool_limit is None:
         tool_limit = 360 if max_chars >= 4000 else 240
 
-    from intent_extractor import _extract_step_timestamp
-
     items: list[str] = []
     user_turn_meta: list[tuple[int, int, str, float | None]] = []
-    for ln in lines_raw:
-        if not ln.strip():
-            continue
-        try:
-            obj = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
+    for obj in step_objs:
         stype = obj.get("type", "")
         step_idx = int(obj.get("step_index", 0))
         if stype == "USER_INPUT":
@@ -805,11 +815,26 @@ def compute_signature(
     tool_name: str,
     tool_args: dict[str, Any],
 ) -> str:
-    if tool_name in ("read_file", "write_file", "edit_file", "view_file", "write_to_file", "replace_file_content"):
+    if tool_name in (
+        "read_file",
+        "write_file",
+        "edit_file",
+        "view_file",
+        "write_to_file",
+        "create_file",
+        "client_create_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+    ):
         raw_path = str(
             tool_args.get("Path")
+            or tool_args.get("path")
             or tool_args.get("TargetFile")
+            or tool_args.get("target_file")
             or tool_args.get("AbsolutePath")
+            or tool_args.get("absolute_path")
+            or tool_args.get("DirectoryPath")
+            or tool_args.get("directory_path")
             or ""
         )
         parent_dir = str(Path(raw_path).parent) if raw_path else ""

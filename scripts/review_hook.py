@@ -73,15 +73,33 @@ OUTPUT_REDIRECT_RE = re.compile(r"(?:^|\s)(?:\d*>>?|&>>?)\s*([^\s;&|]+)")
 COMPOUND_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 DISCARD_REDIRECT_TARGETS = frozenset({"/dev/null", "&1", "&2"})
 
-REVIEWED_TOOLS = frozenset(
+FILE_RW_TOOLS = frozenset(
     {
-        "run_command",
         "read_file",
         "write_file",
         "edit_file",
         "view_file",
         "write_to_file",
+        "create_file",
+        "client_create_file",
         "replace_file_content",
+        "multi_replace_file_content",
+    }
+)
+FILE_WRITE_TOOLS = frozenset(
+    {
+        "write_file",
+        "edit_file",
+        "write_to_file",
+        "create_file",
+        "client_create_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+    }
+)
+REVIEWED_TOOLS = frozenset(FILE_RW_TOOLS) | frozenset(
+    {
+        "run_command",
         "delete_file",
         "call_mcp_tool",
         "list_resources",
@@ -89,6 +107,61 @@ REVIEWED_TOOLS = frozenset(
     }
 )
 REVIEWED_TOOL_PREFIXES = ("mcp_", "browser_")
+
+
+def _extract_command_arg(tool_args: dict[str, Any]) -> str:
+    return str(
+        tool_args.get("CommandLine")
+        or tool_args.get("command_line")
+        or tool_args.get("commandLine")
+        or tool_args.get("command")
+        or ""
+    )
+
+
+def _extract_file_path_arg(tool_args: dict[str, Any]) -> str:
+    return str(
+        tool_args.get("Path")
+        or tool_args.get("path")
+        or tool_args.get("TargetFile")
+        or tool_args.get("target_file")
+        or tool_args.get("AbsolutePath")
+        or tool_args.get("absolute_path")
+        or tool_args.get("DirectoryPath")
+        or tool_args.get("directory_path")
+        or ""
+    )
+
+
+def _gemini_home_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    env_home = os.environ.get("GEMINI_HOME", "").strip()
+    candidates = ([Path(env_home).expanduser()] if env_home else []) + [Path.home() / ".gemini"]
+    for cand in candidates:
+        key = str(cand)
+        if key not in seen:
+            seen.add(key)
+            dirs.append(cand)
+    return dirs
+
+
+def _is_acp_runtime(payload: dict[str, Any]) -> bool:
+    mode_override = os.environ.get("AGY_HOOK_MODE", "").strip().lower()
+    if mode_override == "acp":
+        return True
+    if mode_override in ("cli", "ide"):
+        return False
+    if os.environ.get("AGY_ACP_FORCE_FILE_STORAGE", "").strip() == "1":
+        return True
+    tp = str(payload.get("transcriptPath") or payload.get("transcript_path") or "").strip().lower()
+    return tp.endswith(".db")
+
+
+def _resolve_bypass_sandbox(tool_args: dict[str, Any], acp_mode: bool) -> bool:
+    if "BypassSandbox" in tool_args:
+        return bool(tool_args.get("BypassSandbox", False))
+    return True if acp_mode else False
 
 STANDARD_BIN_PATHS = (
     "/bin",
@@ -305,8 +378,11 @@ HARD_DENY_COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(r"(?:\.ssh[/\\]id_(?:rsa|ed25519|ecdsa|dsa)|\.aws[/\\]credentials|\.netrc|(?:^|[/\\]|\s)\.env(?:\.(?:local|prod|production|secret))?(?:\s|$|[\"']))"),
     ),
     (
-        "Modifying Antigravity settings.json or config.json directly",
-        re.compile(r"\.gemini[/\\](?:antigravity-cli[/\\]settings\.json|config[/\\](?:config|permission_reviewer\.local)\.json)"),
+        "Modifying Antigravity settings.json, ACP credentials, or config.json directly",
+        re.compile(
+            r"\.gemini[/\\](?:antigravity-cli[/\\]settings\.json|config[/\\](?:config|permission_reviewer\.local)\.json)"
+            r"|antigravity-acp[/\\](?:acp_token|settings)\.json"
+        ),
     ),
     (
         "Pipe-to-shell remote execution or dynamic library injection hijack",
@@ -321,10 +397,16 @@ HARD_DENY_COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 def load_local_config() -> dict[str, Any]:
     """Load optional user-local policy overrides (`read_only_repos`, `known_ssh_hosts`, etc.)."""
-    cfg_path = Path(
-        os.environ.get("AGY_PERMISSION_REVIEWER_LOCAL_CONFIG")
-        or os.path.expanduser("~/.gemini/config/permission_reviewer.local.json")
-    )
+    env_cfg = os.environ.get("AGY_PERMISSION_REVIEWER_LOCAL_CONFIG", "").strip()
+    if env_cfg:
+        cfg_path = Path(env_cfg).expanduser()
+    else:
+        gem_env = os.environ.get("GEMINI_HOME", "").strip()
+        gem_cfg = Path(gem_env).expanduser() / "config" / "permission_reviewer.local.json" if gem_env else None
+        if gem_cfg is not None and gem_cfg.is_file():
+            cfg_path = gem_cfg
+        else:
+            cfg_path = Path.home() / ".gemini" / "config" / "permission_reviewer.local.json"
     try:
         if not cfg_path.is_file():
             return {}
@@ -407,6 +489,41 @@ TRUSTED_MCP_SERVERS = (
     "agy-permission-reviewer",
     "agy-permission-reviewer_agy-permission-reviewer",
 )
+
+
+def _protected_write_paths() -> list[str]:
+    paths = list(PROTECTED_WRITE_PATHS)
+    seen = set(paths)
+    for gh in _gemini_home_dirs():
+        for rel in (
+            ("antigravity-acp", "acp_token.json"),
+            ("antigravity-acp", "settings.json"),
+            ("config", "config.json"),
+            ("config", "permission_reviewer.local.json"),
+            ("config", "hooks.json"),
+        ):
+            cand = str(gh.joinpath(*rel))
+            if cand not in seen:
+                seen.add(cand)
+                paths.append(cand)
+    return paths
+
+
+def _sensitive_read_paths() -> list[str]:
+    paths = list(SENSITIVE_READ_PATHS)
+    seen = set(paths)
+    for gh in _gemini_home_dirs():
+        for rel in (
+            ("antigravity-acp", "acp_token.json"),
+            ("antigravity-acp", "settings.json"),
+            ("config", "config.json"),
+            ("antigravity-cli", "settings.json"),
+        ):
+            cand = str(gh.joinpath(*rel))
+            if cand not in seen:
+                seen.add(cand)
+                paths.append(cand)
+    return paths
 
 
 def _audit_file(conversation_id: str) -> Path:
@@ -553,7 +670,7 @@ def extract_shell_output_redirects(code_only: str) -> list[str]:
 
 
 def _is_sensitive_path(norm_path: str) -> bool:
-    return any(is_path_under(norm_path, sp) for sp in SENSITIVE_READ_PATHS)
+    return any(is_path_under(norm_path, sp) for sp in _sensitive_read_paths())
 
 
 def _append_exec_tok(tok: str, cwd: str, strip_std_bin: bool, out: list[str]) -> None:
@@ -1384,7 +1501,7 @@ def is_fast_allow_command(
 
     # Check sensitive read paths across all path tokens, and external paths excluding harmless std bin prefixes
     all_raw_paths = _extract_command_ext_paths(code_only, cwd=cwd, strip_std_bin=False)
-    for sp in SENSITIVE_READ_PATHS:
+    for sp in _sensitive_read_paths():
         if any(is_path_under(p, sp) for p in all_raw_paths):
             return False, ""
 
@@ -1417,6 +1534,7 @@ def check_tier0_static(
     workspace_paths: list[str],
     cwd: str,
     artifact_dir: str = "",
+    acp_mode: bool = False,
 ) -> dict[str, Any] | None:
     """Tier 0: Instant deterministic allow/deny (~1 ms)."""
     if tool_name and tool_name not in REVIEWED_TOOLS and not tool_name.startswith(REVIEWED_TOOL_PREFIXES):
@@ -1439,18 +1557,13 @@ def check_tier0_static(
                 "tier": "tier0_static",
             }
 
-    if tool_name in ("read_file", "write_file", "edit_file", "view_file", "write_to_file", "replace_file_content"):
-        raw_path = str(
-            tool_args.get("Path")
-            or tool_args.get("TargetFile")
-            or tool_args.get("AbsolutePath")
-            or ""
-        )
+    if tool_name in FILE_RW_TOOLS:
+        raw_path = _extract_file_path_arg(tool_args)
         if not raw_path:
             return None
         target = normalize_path(raw_path, cwd=cwd)
 
-        for sp in list(SENSITIVE_READ_PATHS) + extra_denied:
+        for sp in _sensitive_read_paths() + extra_denied:
             if is_path_under(target, sp):
                 return {
                     "decision": "deny",
@@ -1458,7 +1571,7 @@ def check_tier0_static(
                     "tier": "tier0_static",
                 }
 
-        for prot in list(PROTECTED_WRITE_PATHS) + extra_ro:
+        for prot in _protected_write_paths() + extra_ro:
             if is_path_under(target, prot) and tool_name not in ("read_file", "view_file"):
                 return {
                     "decision": "deny",
@@ -1482,8 +1595,8 @@ def check_tier0_static(
         return None
 
     if tool_name == "run_command":
-        cmd = str(tool_args.get("CommandLine", ""))
-        bypass_sandbox = bool(tool_args.get("BypassSandbox", False))
+        cmd = _extract_command_arg(tool_args)
+        bypass_sandbox = _resolve_bypass_sandbox(tool_args, acp_mode)
         sanitized_cmd = strip_commit_message_literals(strip_purpose_comment(cmd))
         for label, pat in list(HARD_DENY_COMMAND_PATTERNS) + build_local_hard_deny_patterns(local_cfg):
             if pat.search(sanitized_cmd):
@@ -1492,7 +1605,7 @@ def check_tier0_static(
                     "reason": f"[Tier 0 Policy] Blocked catastrophic command pattern: {label}.",
                     "tier": "tier0_static",
                 }
-        if sys.platform == "darwin" and not bypass_sandbox and (
+        if not acp_mode and sys.platform == "darwin" and not bypass_sandbox and (
             SANDBOX_INCOMPATIBLE_COMMAND_RE.search(sanitized_cmd)
             or (
                 not DESTRUCTIVE_SCOPE_COMMAND_RE.search(sanitized_cmd)
@@ -1538,6 +1651,7 @@ def check_tier1_ledger(
     workspace_paths: list[str],
     cwd: str,
     ledger: dict[str, Any],
+    acp_mode: bool = False,
 ) -> dict[str, Any] | None:
     """Tier 1: Zero-token check against opt-in verbal grants extracted from USER_INPUT steps."""
     denied_paths: list[str] = ledger.get("denied_paths", [])
@@ -1547,17 +1661,12 @@ def check_tier1_ledger(
         return None
     norm_workspaces = [normalize_path(p) for p in workspace_paths if p]
 
-    if tool_name in ("read_file", "write_file", "edit_file", "view_file", "write_to_file", "replace_file_content"):
-        raw_path = str(
-            tool_args.get("Path")
-            or tool_args.get("TargetFile")
-            or tool_args.get("AbsolutePath")
-            or ""
-        )
+    if tool_name in FILE_RW_TOOLS:
+        raw_path = _extract_file_path_arg(tool_args)
         if not raw_path:
             return None
         target = normalize_path(raw_path, cwd=cwd)
-        needs_write = tool_name in ("write_file", "edit_file", "write_to_file", "replace_file_content")
+        needs_write = tool_name in FILE_WRITE_TOOLS
 
         for dp in denied_paths:
             if is_path_under(target, dp):
@@ -1589,7 +1698,7 @@ def check_tier1_ledger(
         return None
 
     if tool_name == "run_command":
-        cmd = strip_commit_message_literals(strip_purpose_comment(str(tool_args.get("CommandLine", ""))))
+        cmd = strip_commit_message_literals(strip_purpose_comment(_extract_command_arg(tool_args)))
         raw_paths = _extract_command_ext_paths(cmd, cwd=cwd, strip_std_bin=False)
         for ep in raw_paths:
             for dp in denied_paths:
@@ -1608,7 +1717,7 @@ def check_tier1_ledger(
             and not is_path_under(p, "/tmp")
             and not is_path_under(p, "/private/tmp")
         ]
-        needs_write = _command_dir_cache_mode(cmd, bool(tool_args.get("BypassSandbox", False))) == "write"
+        needs_write = _command_dir_cache_mode(cmd, _resolve_bypass_sandbox(tool_args, acp_mode)) == "write"
         if (
             outside_paths
             and not DESTRUCTIVE_SCOPE_COMMAND_RE.search(cmd)
@@ -1642,6 +1751,7 @@ def build_requested_action(
     cwd: str = "",
     artifact_dir: str = "",
     ledger: dict[str, Any] | None = None,
+    acp_mode: bool = False,
 ) -> dict[str, Any]:
     norm_workspaces = [normalize_path(p) for p in (workspace_paths or []) if p]
     user_messages: list[str] = list((ledger or {}).get("recent_user_messages") or [])
@@ -1654,8 +1764,8 @@ def build_requested_action(
     if tool_name == "run_command":
         from intent_extractor import verify_cited_user_authorization
 
-        cmd = str(tool_args.get("CommandLine", ""))
-        bypass = bool(tool_args.get("BypassSandbox", False))
+        cmd = _extract_command_arg(tool_args)
+        bypass = _resolve_bypass_sandbox(tool_args, acp_mode)
         sandbox_on = 0 if bypass else 1
         annotations = _parse_review_annotations(cmd)
         code_only = strip_commit_message_literals(strip_purpose_comment(cmd))
@@ -1721,15 +1831,10 @@ def build_requested_action(
             **({"recent_user_messages": user_messages} if user_messages else {}),
         }
 
-    target = str(
-        tool_args.get("Path")
-        or tool_args.get("TargetFile")
-        or tool_args.get("AbsolutePath")
-        or ""
-    )
+    target = _extract_file_path_arg(tool_args)
     norm_target = normalize_path(target, cwd=cwd) if target else ""
     in_scope = bool(norm_target and is_safe_scoped_path(norm_target, norm_workspaces, artifact_dir))
-    is_edit = tool_name in ("write_file", "edit_file", "write_to_file", "replace_file_content")
+    is_edit = tool_name in FILE_WRITE_TOOLS
     details = {
         "tool": tool_name,
         "targetInWorkspace": in_scope,
@@ -1747,9 +1852,12 @@ def build_requested_action(
 def evaluate_tool_call(
     payload: dict[str, Any],
     api_caller: Any = None,
+    acp_mode: bool | None = None,
 ) -> dict[str, Any]:
     """Run the 3-tier review pipeline (`Policy` -> `Verbal Ledger` -> `jev-1.13-free` + Escalation + Send-Back)."""
     t0 = time.perf_counter()
+    if acp_mode is None:
+        acp_mode = _is_acp_runtime(payload)
     tool_call = payload.get("toolCall") or {}
     tool_name = str(tool_call.get("name", ""))
     tool_args = tool_call.get("args") or {}
@@ -1766,12 +1874,21 @@ def evaluate_tool_call(
     transcript_path = Path(transcript_str) if transcript_str else None
     last_user_input = str(payload.get("lastUserInput", ""))
 
-    res = check_tier0_static(tool_name, tool_args, workspace_paths, cwd, artifact_dir=artifact_dir)
+    res = check_tier0_static(
+        tool_name,
+        tool_args,
+        workspace_paths,
+        cwd,
+        artifact_dir=artifact_dir,
+        acp_mode=acp_mode,
+    )
     if res is None:
         ledger = collect_session_ledger(
             transcript_path, last_user_input=last_user_input, cwd=cwd
         )
-        res = check_tier1_ledger(tool_name, tool_args, workspace_paths, cwd, ledger)
+        res = check_tier1_ledger(
+            tool_name, tool_args, workspace_paths, cwd, ledger, acp_mode=acp_mode
+        )
         if res is None:
             mode = os.environ.get("AGY_REVIEWER_MODE", "opencode").lower()
             if mode == "ledger_only":
@@ -1782,8 +1899,9 @@ def evaluate_tool_call(
                 }
             else:
                 req_key = compute_request_key(conversation_id, tool_name, tool_args)
+                cmd_raw = _extract_command_arg(tool_args)
                 annotations = (
-                    _parse_review_annotations(str(tool_args.get("CommandLine", "")))
+                    _parse_review_annotations(cmd_raw)
                     if tool_name == "run_command"
                     else {"auth": "", "purpose": "", "appeal_requested": False}
                 )
@@ -1791,21 +1909,13 @@ def evaluate_tool_call(
                 is_destructive_cmd = False
                 if tool_name == "run_command":
                     sanitized_for_dest = strip_commit_message_literals(
-                        strip_purpose_comment(str(tool_args.get("CommandLine", "")))
+                        strip_purpose_comment(cmd_raw)
                     )
                     is_destructive_cmd = bool(DESTRUCTIVE_SCOPE_COMMAND_RE.search(sanitized_for_dest))
-                is_file_tool = tool_name in (
-                    "read_file",
-                    "write_file",
-                    "edit_file",
-                    "view_file",
-                    "write_to_file",
-                    "replace_file_content",
-                    "delete_file",
-                )
+                is_file_tool = tool_name in FILE_RW_TOOLS or tool_name == "delete_file"
                 file_mode = (
                     "write"
-                    if tool_name in ("write_file", "edit_file", "write_to_file", "replace_file_content", "delete_file")
+                    if (tool_name in FILE_WRITE_TOOLS or tool_name == "delete_file")
                     else "read"
                 )
                 dir_sig = (
@@ -1825,8 +1935,8 @@ def evaluate_tool_call(
                 cmd_dir_mode = "read"
                 ssh_info: tuple[str, str] | None = None
                 if tool_name == "run_command":
-                    cmd_str = str(tool_args.get("CommandLine", ""))
-                    bypass_sb = bool(tool_args.get("BypassSandbox", False))
+                    cmd_str = cmd_raw
+                    bypass_sb = _resolve_bypass_sandbox(tool_args, acp_mode)
                     norm_ws = [normalize_path(p) for p in workspace_paths if p]
                     sanitized = strip_commit_message_literals(strip_purpose_comment(cmd_str))
                     ssh_info = _parse_ssh_invocation(sanitized)
@@ -1836,8 +1946,9 @@ def evaluate_tool_call(
                         and not DESTRUCTIVE_SCOPE_COMMAND_RE.search(sanitized)
                     ):
                         ext_p = _extract_command_ext_paths(sanitized, cwd=cwd)
+                        sens_paths = _sensitive_read_paths()
                         if not any(
-                            any(is_path_under(p, sp) for sp in SENSITIVE_READ_PATHS)
+                            any(is_path_under(p, sp) for sp in sens_paths)
                             for p in ext_p
                         ):
                             cmd_outside_dirs = [
@@ -1852,12 +1963,7 @@ def evaluate_tool_call(
                 if cached is not None:
                     cached = {**cached, "source": "cache", "model": "session_cache"}
                 if not appeal_requested and cached is None and is_file_tool:
-                    raw_p = str(
-                        tool_args.get("Path")
-                        or tool_args.get("TargetFile")
-                        or tool_args.get("AbsolutePath")
-                        or ""
-                    )
+                    raw_p = _extract_file_path_arg(tool_args)
                     if raw_p:
                         norm_p = normalize_path(raw_p, cwd=cwd)
                         for cd in _dir_grant_candidates(norm_p, include_self=False, max_levels=4):
@@ -1923,6 +2029,7 @@ def evaluate_tool_call(
                         cwd=cwd,
                         artifact_dir=artifact_dir,
                         ledger=ledger,
+                        acp_mode=acp_mode,
                     )
                     local_cfg = load_local_config()
                     decision_models = _resolve_model_list(
@@ -1969,7 +2076,7 @@ def evaluate_tool_call(
                     def _find_relevant_earlier() -> list[str]:
                         query_text = " ".join(
                             [
-                                str(tool_args.get("CommandLine", "")),
+                                cmd_raw,
                                 *(str(t) for t in (requested_action.get("targets") or [])),
                                 *(str(p) for p in ((requested_action.get("details") or {}).get("externalPaths") or [])),
                             ]
@@ -2002,7 +2109,7 @@ def evaluate_tool_call(
                             }
                         else:
                             code_only_fp = strip_commit_message_literals(
-                                strip_purpose_comment(str(tool_args.get("CommandLine", "")))
+                                strip_purpose_comment(cmd_raw)
                             )
                             cmd_fp = hashlib.sha256(code_only_fp.encode("utf-8")).hexdigest()[:24]
                             max_appeals = int(os.environ.get("AGY_MAX_APPEALS_PER_TURN", "4"))
@@ -2133,12 +2240,7 @@ def evaluate_tool_call(
                             if dir_sig is not None:
                                 put_cached_verdict(conversation_id, dir_sig, verdict)
                             if is_file_tool:
-                                raw_p = str(
-                                    tool_args.get("Path")
-                                    or tool_args.get("TargetFile")
-                                    or tool_args.get("AbsolutePath")
-                                    or ""
-                                )
+                                raw_p = _extract_file_path_arg(tool_args)
                                 if raw_p:
                                     norm_p = normalize_path(raw_p, cwd=cwd)
                                     for cd in _dir_grant_candidates(norm_p, include_self=False, max_levels=2):
@@ -2173,14 +2275,11 @@ def evaluate_tool_call(
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     target_summary = ""
     if tool_name == "run_command":
-        target_summary = str(tool_args.get("CommandLine", ""))[:160]
+        target_summary = _extract_command_arg(tool_args)[:160]
     else:
-        target_summary = str(
-            tool_args.get("Path")
-            or tool_args.get("TargetFile")
-            or tool_args.get("AbsolutePath")
-            or tool_args.get("ToolName")
-            or ""
+        target_summary = (
+            _extract_file_path_arg(tool_args)
+            or str(tool_args.get("ToolName") or "")
         )[:160]
     record_audit_entry(
         conversation_id,
@@ -2200,25 +2299,53 @@ def evaluate_tool_call(
     }
 
 
-def to_antigravity_hook_output(res: dict[str, Any]) -> dict[str, Any]:
+def to_antigravity_hook_output(
+    res: dict[str, Any], acp_mode: bool = False
+) -> dict[str, Any]:
     """Translate logical decision ('allow', 'deny', 'ask') to Antigravity PreToolHookResult JSON.
 
-    In Antigravity's `EnsurePermissions`:
-    - `"auto_approve"` triggers `hook_auto_approve`, overriding default `Ask` prompts
-      without requiring the user to set global settings to Always Allow.
-    - `"deny"` blocks the tool call immediately and returns `reason` to the model.
-    - `"force_ask"` forces a native user confirmation popup even if settings are Always Allow.
+    In Antigravity CLI/IDE `EnsurePermissions`:
+    - `"auto_approve"` triggers `hook_auto_approve`.
+    - `"deny"` blocks the tool call immediately.
+    - `"force_ask"` forces a native confirmation popup.
+
+    In Antigravity ACP (`agy_acp_server`, e.g. T3 Code):
+    - `ExternalPreToolCallDecideHook` only denies when `decision == "deny"`; any non-`"deny"`
+      value falls through as `allow=True`. Therefore unresolved `"ask"` fails closed to `"deny"`
+      by default unless explicitly overridden via `AGY_ACP_ASK_DECISION`.
     """
     decision = res.get("decision", "ask")
-    if decision == "allow":
-        wire_decision = os.environ.get("AGY_HOOK_ALLOW_DECISION", "auto_approve")
-    elif decision == "ask":
-        wire_decision = "force_ask"
+    reason = str(res.get("reason", ""))
+    if acp_mode:
+        if decision == "allow":
+            wire_decision = os.environ.get("AGY_HOOK_ALLOW_DECISION", "allow")
+        elif decision == "ask":
+            ask_mode = str(
+                os.environ.get("AGY_ACP_ASK_DECISION")
+                or load_local_config().get("acp_ask_decision")
+                or "deny"
+            ).strip().lower()
+            if ask_mode in ("allow", "force_ask"):
+                wire_decision = ask_mode
+            else:
+                wire_decision = "deny"
+                reason = (
+                    "Auto Permissions blocked this action in ACP mode (ACP hooks cannot show a "
+                    "confirmation popup, so explicit confirmation in chat or manual execution is required): "
+                    + reason
+                )
+        else:
+            wire_decision = decision
     else:
-        wire_decision = decision
+        if decision == "allow":
+            wire_decision = os.environ.get("AGY_HOOK_ALLOW_DECISION", "auto_approve")
+        elif decision == "ask":
+            wire_decision = "force_ask"
+        else:
+            wire_decision = decision
     out: dict[str, Any] = {
         "decision": wire_decision,
-        "reason": res.get("reason", ""),
+        "reason": reason,
     }
     if "overwrite" in res and isinstance(res["overwrite"], dict):
         out["overwrite"] = res["overwrite"]
@@ -2226,19 +2353,26 @@ def to_antigravity_hook_output(res: dict[str, Any]) -> dict[str, Any]:
 
 
 def _find_latest_transcript() -> Path | None:
-    home = Path.home() / ".gemini"
-    if not home.is_dir():
-        return None
     candidates: list[tuple[float, Path]] = []
-    for app_dir in ("antigravity-cli", "antigravity", "antigravity-ide"):
-        brain_dir = home / app_dir / "brain"
-        if not brain_dir.is_dir():
+    for home in _gemini_home_dirs():
+        if not home.is_dir():
             continue
-        for tp in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
-            try:
-                candidates.append((tp.stat().st_mtime, tp))
-            except OSError:
-                continue
+        for app_dir in ("antigravity-cli", "antigravity-acp", "antigravity", "antigravity-ide"):
+            brain_dir = home / app_dir / "brain"
+            if brain_dir.is_dir():
+                for tp in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
+                    try:
+                        candidates.append((tp.stat().st_mtime, tp))
+                    except OSError:
+                        continue
+            if app_dir == "antigravity-acp":
+                conv_dir = home / app_dir / "conversations"
+                if conv_dir.is_dir():
+                    for dp in conv_dir.glob("*.db"):
+                        try:
+                            candidates.append((dp.stat().st_mtime, dp))
+                        except OSError:
+                            continue
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -2340,6 +2474,7 @@ def build_reviewer_status(args: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def main() -> int:
+    payload: dict[str, Any] = {}
     try:
         for stream in (sys.stdin, sys.stdout):
             if hasattr(stream, "reconfigure"):
@@ -2349,10 +2484,12 @@ def main() -> int:
                     pass
         raw = sys.stdin.read().strip()
         payload = json.loads(raw) if raw else {}
-        res = evaluate_tool_call(payload)
-        out = to_antigravity_hook_output(res)
+        acp_mode = _is_acp_runtime(payload)
+        res = evaluate_tool_call(payload, acp_mode=acp_mode)
+        out = to_antigravity_hook_output(res, acp_mode=acp_mode)
         if os.environ.get("AGY_REVIEWER_DEBUG", "0") == "1":
-            with open("/tmp/agy_reviewer_debug.log", "a", encoding="utf-8") as dbg:
+            dbg_path = Path(tempfile.gettempdir()) / "agy_reviewer_debug.log"
+            with dbg_path.open("a", encoding="utf-8") as dbg:
                 dbg.write(
                     json.dumps(
                         {
@@ -2365,10 +2502,11 @@ def main() -> int:
                 )
         sys.stdout.write(json.dumps(out) + "\n")
     except Exception as exc:
+        fail_decision = "deny" if _is_acp_runtime(payload) else "force_ask"
         sys.stdout.write(
             json.dumps(
                 {
-                    "decision": "force_ask",
+                    "decision": fail_decision,
                     "reason": f"[Permission Reviewer Internal Error: {exc}]",
                 }
             )

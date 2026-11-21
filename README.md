@@ -62,4 +62,14 @@ git clone https://github.com/Jimbo-Coder/agy-permission-reviewer ~/.gemini/confi
 git clone https://github.com/Jimbo-Coder/agy-permission-reviewer "$env:USERPROFILE\.gemini\config\plugins\agy-permission-reviewer"
 ```
 
+### T3 Code (Antigravity ACP)
+
+T3 Code runs `agy_acp_server` with an isolated `GEMINI_HOME` per Antigravity profile and links global skills, not plugins. After cloning this repo and enabling Antigravity in T3 Code, wire the `PreToolUse` hook into your T3 Code profile(s):
+
+```bash
+python3 ~/.gemini/config/plugins/agy-permission-reviewer/scripts/install_t3code.py
+```
+
+When running inside Antigravity ACP (SQLite `.db` session trajectories under `$GEMINI_HOME/antigravity-acp`), unresolved `ask` verdicts fail closed to `deny` (since ACP hooks cannot pop up an interactive CLI dialog) and global `~/.gemini/config/permission_reviewer.local.json` is automatically shared.
+
 Companion plugin: [agy-context-guard](https://github.com/Jimbo-Coder/agy-context-guard) (context window monitor and self-triggered compaction).

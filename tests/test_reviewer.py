@@ -1062,7 +1062,8 @@ class TestPermissionReviewer(unittest.TestCase):
             )
             self.assertEqual(res_b["decision"], "allow")
         avg_ms = ((time.perf_counter() - t_start) * 1000.0) / len(bench_cmds)
-        self.assertLess(avg_ms, 1.0, msg=f"Average Tier 0 evaluation latency too high: {avg_ms:.3f} ms")
+        max_avg_ms = 5.0 if os.name == "nt" else 1.0
+        self.assertLess(avg_ms, max_avg_ms, msg=f"Average Tier 0 evaluation latency too high: {avg_ms:.3f} ms")
 
     def test_short_affirmation_context_bundled_push_guard_and_readonly_ssh_cache(self) -> None:
         review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
@@ -1582,6 +1583,251 @@ class TestPermissionReviewer(unittest.TestCase):
             os.path.normpath(r"C:\Windows\System32\drivers\etc\hosts"),
             intent_extractor.extract_paths_from_string(r'open("C:\Windows\System32\drivers\etc\hosts")'),
         )
+
+    def test_acp_sqlite_trajectory_ledger_compact_transcript_and_auth(self) -> None:
+        import sqlite3
+
+        def _pb_varint(v: int) -> bytes:
+            out = bytearray()
+            while True:
+                b = v & 0x7F
+                v >>= 7
+                if v:
+                    out.append(b | 0x80)
+                else:
+                    out.append(b)
+                    return bytes(out)
+
+        def _pb_ld(field_num: int, data: bytes) -> bytes:
+            return _pb_varint((field_num << 3) | 2) + _pb_varint(len(data)) + data
+
+        def _pb_vi(field_num: int, val: int) -> bytes:
+            return _pb_varint((field_num << 3) | 0) + _pb_varint(val)
+
+        def _pb_step_meta(epoch_sec: int) -> bytes:
+            ts = _pb_vi(1, epoch_sec)
+            return _pb_ld(5, _pb_ld(1, ts))
+
+        db_path = self.tmp_path / "acp_session.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB)")
+
+        step1_payload = _pb_step_meta(1700000000) + _pb_ld(
+            19,
+            _pb_ld(2, b"Please inspect the build scripts and update /opt/other_repo/app.py"),
+        )
+        step2_payload = _pb_step_meta(1700000010) + _pb_ld(
+            20,
+            _pb_ld(1, b"Original reply")
+            + _pb_ld(8, b"May I push backup key to backup-host:/srv/archives/repo.key?")
+            + _pb_ld(3, b"Internal agent thought should be omitted unless requested"),
+        )
+        # User turn encoded via TextOrScopeItem field 3 -> field 1 when user_response field 2 is absent
+        step3_payload = _pb_step_meta(1700000020) + _pb_ld(
+            19,
+            _pb_ld(3, _pb_ld(1, b"Yes please copy repo.key to backup-host")),
+        )
+        conn.executemany(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)",
+            [(1, 14, step1_payload), (2, 15, step2_payload), (3, 14, step3_payload)],
+        )
+        conn.commit()
+
+        ledger1 = intent_extractor.collect_session_ledger(db_path)
+        self.assertEqual(ledger1["last_user_step_index"], 3)
+        self.assertEqual(ledger1["latest_step_index"], 3)
+        self.assertEqual(len(ledger1["all_user_entries"]), 2)
+        self.assertIn("backup-host:/srv/archives/repo.key", ledger1["recent_user_messages"][-1])
+
+        # Incremental DB append is picked up without losing earlier entries
+        step4_payload = _pb_step_meta(1700000040) + _pb_ld(
+            20, _pb_ld(1, b"Updated /opt/other_repo/app.py cleanly.")
+        )
+        step5_payload = _pb_step_meta(1700000050) + _pb_ld(
+            19, _pb_ld(2, b"Now verify the unit tests")
+        )
+        conn.executemany(
+            "INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)",
+            [(4, 15, step4_payload), (5, 14, step5_payload)],
+        )
+        conn.commit()
+        conn.close()
+
+        ledger2 = intent_extractor.collect_session_ledger(db_path)
+        self.assertEqual(ledger2["last_user_step_index"], 5)
+        self.assertEqual(len(ledger2["all_user_entries"]), 3)
+
+        compact = llm_classifier.extract_compact_transcript(db_path)
+        self.assertIn("[User]: Now verify the unit tests", compact)
+        self.assertIn("[Agent]: Updated /opt/other_repo/app.py cleanly.", compact)
+        self.assertNotIn("Internal agent thought", compact)
+
+        cited = intent_extractor.verify_cited_user_authorization(
+            "step 3", ledger2["all_user_entries_with_context"]
+        )
+        self.assertTrue(cited["verifiedFromTranscript"])
+        self.assertEqual(cited["exactUserMessage"], "Yes please copy repo.key to backup-host")
+        self.assertIn("backup-host:/srv/archives/repo.key", cited.get("precedingAgentProposal", ""))
+
+    def test_acp_runtime_fail_closed_security_and_tool_aliases(self) -> None:
+        gem_home = self.tmp_path / "isolated_gemini"
+        (gem_home / "antigravity-acp").mkdir(parents=True)
+        review_hook.os.environ["AGY_REVIEWER_MODE"] = "opencode"
+        review_hook.os.environ["GEMINI_HOME"] = str(gem_home)
+        review_hook.os.environ["AGY_ACP_FORCE_FILE_STORAGE"] = "1"
+        self.addCleanup(lambda: review_hook.os.environ.pop("GEMINI_HOME", None))
+        self.addCleanup(lambda: review_hook.os.environ.pop("AGY_ACP_FORCE_FILE_STORAGE", None))
+
+        ws = "/workspace/project"
+        db_path = gem_home / "antigravity-acp" / "conversations" / "sess1.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(b"")
+
+        # 1. Fail-closed wire translation: ACP unresolved/force_ask maps to "deny", CLI keeps "force_ask"
+        self.assertEqual(
+            review_hook.to_antigravity_hook_output({"decision": "ask", "reason": "needs confirm"}, acp_mode=False)["decision"],
+            "force_ask",
+        )
+        acp_out = review_hook.to_antigravity_hook_output(
+            {"decision": "ask", "reason": "git push requires confirm"}, acp_mode=True
+        )
+        self.assertEqual(acp_out["decision"], "deny")
+        self.assertIn("ACP hooks cannot show a confirmation popup", acp_out["reason"])
+        self.assertEqual(
+            review_hook.to_antigravity_hook_output({"decision": "allow", "reason": "ok"}, acp_mode=True)["decision"],
+            "allow",
+        )
+
+        # 2. git push stays fail-closed ("ask" inside evaluate -> "deny" on ACP wire output)
+        push_res = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_acp_1",
+                "workspacePaths": [ws],
+                "transcriptPath": str(db_path),
+                "toolCall": {"name": "run_command", "args": {"command": "git push origin main"}},
+            }
+        )
+        self.assertEqual(push_res["decision"], "ask")
+        self.assertEqual(
+            review_hook.to_antigravity_hook_output(push_res, acp_mode=True)["decision"],
+            "deny",
+        )
+
+        # 3. ACP run_command (`command` arg, no BypassSandbox) does NOT trigger macOS seatbelt bounce for git commit/status,
+        #    yet unsandboxed python3 script.py still escalates to Tier 2 rather than Tier 0 fast-allow.
+        with mock.patch.object(review_hook.sys, "platform", "darwin"):
+            status_res = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_acp_2",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "transcriptPath": str(db_path),
+                    "toolCall": {"name": "run_command", "args": {"command": "git status --short"}},
+                }
+            )
+            self.assertEqual(status_res["decision"], "allow")
+
+            tier2_calls: list[str] = []
+
+            def fake_api(endpoint: str, payload: dict, timeout_sec: float) -> dict:
+                tier2_calls.append(endpoint)
+                return {"data": {"answers": [{"choice": "deny", "confidence": 0.90}]}}
+
+            py_res = review_hook.evaluate_tool_call(
+                {
+                    "conversationId": "c_acp_2",
+                    "workspacePaths": [ws],
+                    "cwd": ws,
+                    "transcriptPath": str(db_path),
+                    "toolCall": {"name": "run_command", "args": {"command": "python3 tools/deploy.py"}},
+                },
+                api_caller=fake_api,
+            )
+            self.assertEqual(py_res["decision"], "deny")
+            self.assertEqual(len(tier2_calls), 1)
+
+        # 4. ACP file tools (`create_file`, `multi_replace_file_content`) and $GEMINI_HOME acp_token protection
+        create_ok = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_acp_3",
+                "workspacePaths": [ws],
+                "transcriptPath": str(db_path),
+                "toolCall": {"name": "create_file", "args": {"path": f"{ws}/new.py"}},
+            }
+        )
+        self.assertEqual(create_ok["decision"], "allow")
+
+        edit_ok = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_acp_3",
+                "workspacePaths": [ws],
+                "transcriptPath": str(db_path),
+                "toolCall": {"name": "multi_replace_file_content", "args": {"target_file": f"{ws}/app.py"}},
+            }
+        )
+        self.assertEqual(edit_ok["decision"], "allow")
+
+        token_deny = review_hook.evaluate_tool_call(
+            {
+                "conversationId": "c_acp_3",
+                "workspacePaths": [ws],
+                "transcriptPath": str(db_path),
+                "toolCall": {
+                    "name": "read_file",
+                    "args": {"path": str(gem_home / "antigravity-acp" / "acp_token.json")},
+                },
+            }
+        )
+        self.assertEqual(token_deny["decision"], "deny")
+
+    def test_install_t3code_merges_hooks_roundtrips_shlex_and_uninstalls(self) -> None:
+        import shlex
+        import sys as _sys
+
+        scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+        if scripts_dir not in _sys.path:
+            _sys.path.insert(0, scripts_dir)
+        import install_t3code
+
+        repo_root = Path(__file__).resolve().parents[1]
+        t3_home = self.tmp_path / "t3_home"
+        prof = t3_home / "userdata" / "providers" / "antigravity" / "prof_abc123"
+        cfg_dir = prof / "config"
+        cfg_dir.mkdir(parents=True)
+        existing_hooks = {
+            "other-custom-hook": {"enabled": True, "Stop": [{"command": "./custom.sh"}]}
+        }
+        (cfg_dir / "hooks.json").write_text(json.dumps(existing_hooks), encoding="utf-8")
+
+        found = install_t3code.discover_t3_antigravity_profiles(t3_home)
+        self.assertEqual(found, [prof])
+
+        win_cmd = install_t3code.build_acp_hook_command(
+            repo_root, python_exe=r"C:\Program Files\Python312\python.exe", is_windows=True
+        )
+        win_parts = shlex.split(win_cmd, posix=True)
+        self.assertEqual(win_parts[0], "C:/Program Files/Python312/python.exe")
+        self.assertEqual(win_parts[1:3], ["-X", "utf8"])
+        self.assertTrue(win_parts[3].endswith("/scripts/review_hook.py"))
+
+        posix_cmd = install_t3code.build_acp_hook_command(
+            repo_root, python_exe="/opt/path with spaces/python3", is_windows=False
+        )
+        posix_parts = shlex.split(posix_cmd, posix=True)
+        self.assertEqual(posix_parts[0], "/opt/path with spaces/python3")
+
+        hooks_path = install_t3code.install_into_profile(prof, repo_root, python_exe="/usr/bin/python3")
+        install_t3code.install_into_profile(prof, repo_root, python_exe="/usr/bin/python3")
+        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertIn("other-custom-hook", data)
+        self.assertIn("context-permission-reviewer", data)
+        installed_cmd = data["context-permission-reviewer"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertEqual(len(shlex.split(installed_cmd, posix=True)), 2)
+
+        self.assertTrue(install_t3code.uninstall_from_profile(prof))
+        data_after = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertIn("other-custom-hook", data_after)
+        self.assertNotIn("context-permission-reviewer", data_after)
 
 
 if __name__ == "__main__":

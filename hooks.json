@@ -3,7 +3,7 @@
     "enabled": true,
     "PreToolUse": [
       {
-        "matcher": "^(run_command|read_file|write_file|edit_file|view_file|write_to_file|replace_file_content|delete_file|call_mcp_tool|list_resources|read_resource|mcp_.*|browser_.*)$",
+        "matcher": "^(run_command|read_file|write_file|edit_file|view_file|write_to_file|create_file|client_create_file|replace_file_content|multi_replace_file_content|delete_file|call_mcp_tool|list_resources|read_resource|mcp_.*|browser_.*)$",
         "hooks": [
           {
             "type": "command",
